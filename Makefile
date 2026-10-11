@@ -13,14 +13,44 @@ BPF_OBJECTS := $(patsubst bpf/%.bpf.c,$(BPF_DIR)/%.bpf.o,$(BPF_SOURCES))
 
 all: bpf rust
 
+# vmlinux.h only has to DEFINE the types the BPF sources touch. It does not
+# have to come from the kernel the objects will eventually run on: the header
+# bpftool generates carries
+# `#pragma clang attribute push (__attribute__((preserve_access_index)))`, so
+# every direct field access emits a CO-RE relocation record and libbpf fixes
+# the offsets at load time against whatever kernel is actually running. Verified
+# by building under 6.12.63 and loading the unchanged objects on 6.19.14 --
+# see infra/kernel/core-portability.sh, which makes that check repeatable.
+#
+# So PREBUILT_VMLINUX_H lets a build use a header generated elsewhere, which is
+# what makes it possible to compile where there is no /sys/kernel/btf/vmlinux
+# and no bpftool at all (a container, a release pipeline, a cross build).
+ifneq ($(PREBUILT_VMLINUX_H),)
+$(VMLINUX_H): $(PREBUILT_VMLINUX_H)
+	@mkdir -p $(dir $@)
+	cp $< $@.part
+	mv $@.part $@
+else
+# A header generated here comes from whatever kernel and bpftool this machine
+# has, and bpftool 7.5 and later writes a prototype for every kfunc that kernel
+# exports. One of them can disagree with the declaration the distribution's
+# libbpf headers carry for the same kfunc, and bpf_helpers.h then does not
+# compile: Fedora 43's libbpf 1.6.1 declares bpf_stream_vprintk with four
+# arguments, its 6.17 kernel exports it with five. The sources declare the
+# kfuncs they call themselves (skyline_cc.bpf.c), so these prototypes are
+# switched off. Not for PREBUILT_VMLINUX_H: the pinned reference header a
+# release is built against keeps its prototypes, and the released objects
+# stay byte for byte what they were.
+VMLINUX_CFLAGS := -DBPF_NO_KFUNC_PROTOTYPES
 $(VMLINUX_H): $(VMLINUX_BTF)
 	@mkdir -p $(dir $@)
 	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@.part
 	mv $@.part $@
+endif
 
 $(BPF_DIR)/%.bpf.o: bpf/%.bpf.c bpf/include/skyline_abi.h $(VMLINUX_H)
 	@mkdir -p $(BPF_DIR)
-	$(BPF_CLANG) $(BPF_CFLAGS) -I bpf/include -c $< -o $@
+	$(BPF_CLANG) $(BPF_CFLAGS) $(VMLINUX_CFLAGS) -I bpf/include -c $< -o $@
 
 bpf: $(BPF_OBJECTS)
 

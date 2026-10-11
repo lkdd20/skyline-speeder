@@ -463,6 +463,10 @@ def module_config_command(spec):
         str(spec.max_queue_delay_ratio),
         "--initial-cwnd-packets",
         str(spec.initial_cwnd_packets),
+        # Always explicit: ssctl's built-in default follows the shipped
+        # templates, not the docs/04 set -- see ModuleConfigSpec.min_cwnd_packets.
+        "--min-cwnd-packets",
+        str(spec.min_cwnd_packets),
         "--min-rtt-window-s",
         str(spec.min_rtt_window_s),
         "--bw-window-rtts",
@@ -511,6 +515,30 @@ def retransmit_dscp_command(spec):
 
 def apply_retransmit_dscp(case, server):
     return server.run(retransmit_dscp_command(case.profile.retransmit_dscp), check=False)
+
+
+def redundancy_command(spec):
+    """Pure command construction, mirrors retransmit_dscp_command(). The one
+    spec whose absence does NOT mean a reset: the installed template turns
+    first-flight redundancy on, and every docs/04-performance-report.md case
+    ran without copies, so a profile that does not ask for them is sent
+    `--disable` explicitly -- a reset would quietly give it copies.
+    """
+    if spec is None or not spec.enabled:
+        return ["sudo", "ssctl", "set-redundancy", "--disable"]
+    return [
+        "sudo",
+        "ssctl",
+        "set-redundancy",
+        "--first-kib",
+        str(spec.first_kib),
+        "--delay-ms",
+        str(spec.delay_ms),
+    ]
+
+
+def apply_redundancy(case, server):
+    return server.run(redundancy_command(case.profile.redundancy), check=False)
 
 
 def restore_profile(manifest, server):
@@ -628,7 +656,7 @@ def communicate_or_terminate(process, timeout):
 
 def _collect_failure_diagnostics(
     case_dir, server, server_process, metrics_process, perf_process,
-    event_start_line, router_sudo,
+    event_cursor, router_sudo,
 ):
     """Best-effort diagnostic capture for a case whose try block raised
     before reaching its own normal diagnostic-collection code (e.g. the
@@ -690,8 +718,8 @@ def _collect_failure_diagnostics(
             [
                 "sudo",
                 "/opt/skyline-speeder/infra/snapshot-skyline-events.sh",
-                "from",
-                str(event_start_line),
+                "since",
+                event_cursor,
             ],
             check=False,
             timeout=15,
@@ -753,6 +781,14 @@ def cleanup_case(manifest, server, client, router_sudo):
             server.run(["sudo", "ssctl", "reset-retransmit-dscp"], check=False),
         )
     )
+    # Back to the configuration file's value, like the resets above; the
+    # next case's apply_redundancy() pins its own setting again.
+    records.append(
+        (
+            "server redundancy",
+            server.run(["sudo", "ssctl", "reset-redundancy"], check=False),
+        )
+    )
     records.append(("server offload", set_offload(manifest, server, "on")))
     records.append(("client offload", set_offload(manifest, client, "on")))
     records.append(("host path", clear_path(router_sudo)))
@@ -795,7 +831,8 @@ def run_case(
         "error": None,
     }
     processes = []
-    event_start_line = 1
+    # "0:0" = "no log yet", i.e. everything in it is this case's.
+    event_cursor = "0:0"
     # Only used when case.scenario.segments is non-empty (see
     # _run_segment_schedule below); always bound so the `finally` block can
     # unconditionally stop/join them regardless of where an exception was
@@ -847,6 +884,12 @@ def run_case(
             if module_config_result is not None and module_config_result.returncode == 0
             else None
         )
+        redundancy_result = (
+            apply_redundancy(case, server)
+            if retransmit_dscp_result is not None
+            and retransmit_dscp_result.returncode == 0
+            else None
+        )
         profile_text = profile_result.stdout + profile_result.stderr
         if rack_rto_result is not None:
             profile_text += (
@@ -864,6 +907,10 @@ def run_case(
                 + retransmit_dscp_result.stdout
                 + retransmit_dscp_result.stderr
             )
+        if redundancy_result is not None:
+            profile_text += (
+                "\n[redundancy]\n" + redundancy_result.stdout + redundancy_result.stderr
+            )
         write_text(case_dir / "profile.txt", profile_text)
         if profile_result.returncode != 0:
             raise RuntimeError(
@@ -880,6 +927,10 @@ def run_case(
         if retransmit_dscp_result is not None and retransmit_dscp_result.returncode != 0:
             raise RuntimeError(
                 f"retransmit dscp config exited with {retransmit_dscp_result.returncode}"
+            )
+        if redundancy_result is not None and redundancy_result.returncode != 0:
+            raise RuntimeError(
+                f"redundancy config exited with {redundancy_result.returncode}"
             )
         client_buffers_result = raise_client_socket_buffers(client)
         write_text(
@@ -924,14 +975,20 @@ def run_case(
             case_dir / "nstat-before.txt",
             server.run(["nstat", "-az"], check=False).stdout,
         )
-        event_count = server.run(
-            ["sudo", "/opt/skyline-speeder/infra/snapshot-skyline-events.sh", "count"],
-            check=False,
+        # An INODE:LINES cursor rather than a line number: the daemon
+        # rotates the log at runtime.events_max_mib, and the snapshot
+        # script needs to know which file the count was taken in.
+        event_cursor = (
+            server.run(
+                [
+                    "sudo",
+                    "/opt/skyline-speeder/infra/snapshot-skyline-events.sh",
+                    "cursor",
+                ],
+                check=False,
+            ).stdout.strip()
+            or "0:0"
         )
-        try:
-            event_start_line = int(event_count.stdout.strip() or "0") + 1
-        except ValueError:
-            event_start_line = 1
         write_text(
             case_dir / "skyline-status-before.json",
             server.run(["sudo", "ssctl", "status"], check=False).stdout,
@@ -1159,8 +1216,8 @@ def run_case(
                 [
                     "sudo",
                     "/opt/skyline-speeder/infra/snapshot-skyline-events.sh",
-                    "from",
-                    str(event_start_line),
+                    "since",
+                    event_cursor,
                 ],
                 check=False,
             ).stdout,
@@ -1217,7 +1274,7 @@ def run_case(
                 server_process,
                 metrics_process,
                 perf_process,
-                event_start_line,
+                event_cursor,
                 router_sudo,
             )
         for process in processes:

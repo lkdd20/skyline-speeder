@@ -47,7 +47,18 @@ iperf3 -c <对端IP> -u -b 400M -t 10
 | 四个加速模块 | **全开** | 见下一节 |
 | 动态 RTO 调节 | **关闭** | 需要手动开，见第五节 |
 | 重传包 DSCP 标记 | **关闭，且值为 0** | ⚠️ 见第六节，**开之前必须先问网络管理员** |
-| 摘除后回落算法 | `cubic` | 出问题时自动退回的系统默认算法 |
+| 首轮冗余 | **开**：握手包 + 每条连接前 64 KiB 发两份，第二份晚 10 ms | 丢包多的线路上短请求（网页、API）不用干等丢包恢复；代价是每条连接约多发 64 KiB，丢包重传时会更多。关掉：`sudo ssctl set-redundancy --disable`，恢复配置文件的值：`sudo ssctl reset-redundancy`；要重启后也关着，在配置文件里写 `[redundancy]` `enabled = false` |
+| 摘除后回落算法（`fallback_cc`） | 这台机器开机时的默认算法（安装时自动选，通常是 `bbr`；选不出来时是 `cubic`） | `drain` 摘除之后新连接用它 |
+| 拥塞控制与 qdisc 守护（guard） | **开**，每 5 秒检查一次 | 被别的脚本改回 bbr / cake 会自动改回来，见第七节 |
+
+安装脚本结束时会打印一份摘要：拥塞控制和 qdisc 改之前、之后各是什么，常用命令，以及
+几个最常用参数的当前值。装的过程中所有命令的输出都在 `/var/log/skyline-speeder-install.log`，
+出错时先看它。
+
+> Alpine 用的是 OpenRC：下文的 `sudo systemctl restart skyline-speederd` 在那里是
+> `rc-service skyline-speederd restart`，`journalctl -u skyline-speederd` 换成
+> `grep skyline-speederd /var/log/messages`（Alpine 默认没有 sudo，以 root 执行即可）。
+> 安装脚本最后打印的命令已经按本机写好。
 
 检查当前状态：
 
@@ -62,15 +73,18 @@ sudo ssctl status
 | 模块 | 大白话 | 建议 |
 |---|---|---|
 | `adaptive-cwnd` | **自动调节一次能发多少**。核心模块，加速主要靠它 | 保持开 |
-| `loss-classifier` | **分辨"丢包是噪声还是真拥塞"**，噪声就不减速 | 保持开 |
+| `loss-classifier` | **按测得的丢包率多发一点**，补上路上丢掉的那部分（有封顶，见 `--loss-inflation-max-ratio`） | 保持开 |
 | `pacing` | **把数据均匀发出去**，而不是一股脑挤出去 | 保持开 |
 | `early-loss` | **更早发现丢包**。当前内核上只做观测，不影响决策 | 保持开（开了也不会有副作用）|
 
 全开（默认）：
 
 ```bash
-sudo ssctl enable
+sudo ssctl enable --modules early-loss,adaptive-cwnd,loss-classifier,pacing
 ```
+
+> 不带 `--modules` 的 `sudo ssctl enable` 沿用 daemon 当前的模块集合：刚装好时就是全开，但执行过下面的
+> `--modules` 或 `--all-off` 之后，要像上面这样把四个都写上才回到全开（或者重启 daemon）。
 
 > [!IMPORTANT]
 > `ssctl enable` 执行成功后，**这台机器上所有新建 TCP 连接**都会默认走 `skyline_cc`
@@ -89,7 +103,8 @@ sudo ssctl enable --modules adaptive-cwnd,pacing
 sudo ssctl enable --all-off
 ```
 
-> 全关时它的表现和系统原生 CUBIC 差异 <0.01%，可以放心当作对照基准。
+> 全关时它不做任何加速，是一个中性基准，可以放心当作对照组（验证数据见
+> [docs/03-design.md](03-design.md) 第 4 节）。
 
 ---
 
@@ -98,18 +113,23 @@ sudo ssctl enable --all-off
 > [!CAUTION]
 > **`ssctl set-module-config` 是"全量覆盖"，不是"只改你写的那个"。**
 >
-> 每个参数在命令行里都有内置默认值。你只写一个参数时，**其余 15 个会被静默重置成
+> 每个参数在命令行里都有内置默认值。你只写一个参数时，**其余 16 个会被静默重置成
 > 内置默认值**，而不是保持你配置文件里的自定义值。
 >
 > ```bash
-> # 危险：你以为只改了护栏，实际上其他 15 个参数全被重置了
+> # 危险：你以为只改了护栏，实际上其他 16 个参数全被重置了
 > sudo ssctl set-module-config --guardrail-gain 0.5
 > ```
 >
-> **正确做法**：先 `ssctl status` 看当前值，然后把**所有**你想保留的参数一起写全。
+> **正确做法**：先 `ssctl flows` 看当前值（PARAMETERS IN FORCE 段落），然后把**所有**你想保留的参数一起写全。
 > 如果你从没改过配置文件，内置默认值恰好和出厂值一致，那么单独写一个是安全的。
+>
+> 例外：从 0.3.x 及更早版本升级、保留了原配置文件的主机。安装脚本不会覆盖已有的
+> `/etc/skyline-speeder/speeder.toml`，里面仍是当时的默认值（0.1.0 装的是下面的「④ 高随机丢包档」，
+> 0.2.0 与 0.3.x 装的 `min_cwnd_packets` 是 4），和新版 `ssctl` 的内置默认值不同。在这类主机上单独写
+> 一个参数，会把其余参数一起换成新默认值；而 `reset-module-config` 回到的是配置文件里的旧值。
 
-想回到出厂设置，随时可以：
+想回到配置文件里的设置（全新安装的主机上就是出厂设置），随时可以：
 
 ```bash
 sudo ssctl reset-module-config
@@ -121,21 +141,22 @@ sudo ssctl reset-module-config
 
 | 参数 | 它管什么 | 调大会怎样 | 调小会怎样 | 默认 |
 |---|---|---|---|---:|
-| `--cruise-inflight-gain` | **稳定期最多能比理论值多发多少** | 高丢包时更能顶住 | 高丢包下发不出去 | `2.0` |
-| `--cruise-pacing-gain` | **稳定期发送速率是估算带宽的多少倍** | 更激进，可能堆队列 | 更保守，吞吐低 | `1.1` |
+| `--cruise-inflight-gain` | **稳定期最多能比理论值多发多少** | 高丢包时更能顶住 | 高丢包下发不出去 | `3.0` |
+| `--cruise-pacing-gain` | **稳定期发送速率是估算带宽的多少倍** | 更激进，可能堆队列 | 更保守，吞吐低 | `1.25` |
 | `--guardrail-gain` | **发现真拥塞时降到原来的几成**（自我保护） | 降得少，更激进 | 降得狠，更安全 | `0.8` |
-| `--loss-inflation-max-ratio` | **最多为丢包补偿多发多少**（0.5 = 最多多发 50%） | 丢包补偿更强 | 补偿更弱 | `0.5` |
-| `--max-queue-delay-ms` | **排队延迟超过多少毫秒就认为堵了** | 更晚才减速，延迟更高 | 更早减速，延迟更低 | `100` |
+| `--loss-inflation-max-ratio` | **最多按多高的丢包率做补偿**（按 `1/(1-p)` 多发：0.10 ≈ 多发 11%，0.5 = 多发一倍） | 随机丢包链路上补偿更足；拥塞型瓶颈上会越丢越发 | 补偿更弱，更不容易自己把链路挤爆 | `0.10` |
+| `--max-queue-delay-ms` | **排队延迟超过多少毫秒就认为堵了** | 更晚才减速，延迟更高 | 更早减速，延迟更低 | `70` |
 | `--startup-gain` | **刚开始连接时冲多猛** | 起速快，可能过冲 | 起速慢更稳 | `3.0` |
 | `--initial-cwnd-packets` | **一开始就发多少个包**（不用慢慢试探） | 小文件传输更快 | 更保守 | `100` |
 | `--max-pacing-mbps` | **速率硬上限**，单位 Mbps | 允许跑更快 | 限速 | `1200` |
 | `--max-cwnd-packets` | **未确认数据的硬上限**，单位包数 | 允许更多在途数据 | 省内存但限吞吐 | `50000` |
+| `--min-cwnd-packets` | **窗口的下限**，单位包数（只在 `adaptive-cwnd` 开启时生效） | 小流量连接丢包后窗口里还有足够的包触发快速恢复，不必干等超时；短响应超时之后也从这个窗口重新发，不必从 1 个包爬起；发送速率仍由 pacing 决定，不会因此发得更快 | 回到历史行为（4） | `32` |
 
 **改完立刻生效，不用重启**，而且是在每条连接的 RTT 边界上平滑切换，不会传到一半出乱子。
 
-### 三档现成配方（复制即用）
+### 四档现成配方（复制即用）
 
-Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面三条命令是我们整理的等价档位，
+Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面四档是我们整理的等价档位，
 **直接复制粘贴**即可，不需要理解每个参数。
 
 **① 保守档 —— 低延迟优先**（游戏、语音、SSH 交互）
@@ -143,14 +164,15 @@ Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面三�
 ```bash
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
-  --max-queue-delay-ms 50 --max-queue-delay-ratio 1.0 \
-  --initial-cwnd-packets 50 --min-rtt-window-s 10 --bw-window-rtts 10 \
+  --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
+  --initial-cwnd-packets 50 --min-cwnd-packets 32 \
+  --min-rtt-window-s 30 --bw-window-rtts 6 \
   --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 2.0 \
   --cruise-inflight-gain 1.5 --cruise-pacing-gain 1.05 \
-  --guardrail-gain 0.7 --loss-inflation-max-ratio 0.5
+  --guardrail-gain 0.7 --loss-inflation-max-ratio 0.10
 ```
 
-**② 默认档 —— 出厂设置**（等价于 `ssctl reset-module-config`）
+**② 默认档 —— 出厂设置**（等价于 `ssctl reset-module-config`；从 0.3.x 及更早升级、保留了原配置文件的主机上，它回到的是那份旧配置，0.1.0 即 ④。要切到新默认档，执行不带任何参数的 `sudo ssctl set-module-config`，它发送的正是新版内置默认值；想重启后依然生效，再改配置文件，见「让档位重启后依然生效」）
 
 ```bash
 sudo ssctl reset-module-config
@@ -162,7 +184,8 @@ sudo ssctl reset-module-config
 sudo ssctl set-module-config \
   --max-pacing-mbps 2000 --max-cwnd-packets 100000 \
   --max-queue-delay-ms 200 --max-queue-delay-ratio 2.0 \
-  --initial-cwnd-packets 200 --min-rtt-window-s 30 --bw-window-rtts 10 \
+  --initial-cwnd-packets 200 --min-cwnd-packets 32 \
+  --min-rtt-window-s 30 --bw-window-rtts 10 \
   --startup-plateau-rtts 5 --startup-growth-ratio 0.15 --startup-gain 4.0 \
   --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.3 \
   --guardrail-gain 1.0 --loss-inflation-max-ratio 0.5
@@ -172,15 +195,20 @@ sudo ssctl set-module-config \
 
 | 参数 | 默认 | 激进 | 效果 |
 |---|---:|---:|---|
-| `cruise-pacing-gain` | 1.1 | **1.3** | 稳定期按带宽估计的 1.3 倍发 —— **最主要的提速旋钮** |
-| `cruise-inflight-gain` | 2.0 | **3.0** | 允许更多数据同时在途 |
+| `cruise-pacing-gain` | 1.25 | **1.3** | 稳定期按带宽估计的 1.3 倍发 |
+| `cruise-inflight-gain` | 3.0 | 3.0 | 与默认档相同 |
 | `startup-gain` | 3.0 | **4.0** | 起步冲得更猛 |
+| `startup-growth-ratio` | 0.20 | **0.15** | 带宽每轮增长不到 15% 才算到顶，更晚退出 STARTUP |
 | `guardrail-gain` | 0.8 | **1.0** | 检测到拥塞时**不再降速**（1.0 = 中性） |
-| `max-queue-delay-ms` | 100 | **200** | 排队延迟翻倍才认为"堵了" |
+| `max-queue-delay-ms` / `max-queue-delay-ratio` | 70 / 0.6 | **200 / 2.0** | 排队延迟高得多才认为"堵了" |
+| `loss-inflation-max-ratio` | 0.10 | **0.5** | 丢包补偿放开到最多多发一倍 |
+| `bw-window-rtts` | 6 | **10** | 带宽估计记住更久以前的峰值 |
 | `initial-cwnd-packets` | 100 | **200** | 连接一建立就发 200 个包 |
 | `max-cwnd-packets` / `max-pacing-mbps` | 50000 / 1200 | **100000 / 2000** | 抬高两个硬上限 |
 
-**实测效果**（东京机房 → 客户端，RTT ≈ 18ms 干净链路，经代理下载 50MB，5 轮交错对比）：
+**实测效果**（单台服务器 → 客户端，RTT ≈ 18ms 的干净链路，下载 50MB，5 轮交错对比）。
+这组数据测于默认系数调整**之前**：表里的「默认档」是当时的默认值，也就是下面的
+「④ 高随机丢包档」；现在的默认档没有在这条链路上重测过。
 
 | | 默认档 | 激进档 |
 |---|---:|---:|
@@ -199,6 +227,26 @@ sudo ssctl set-module-config \
 > 它会持续挤占缓冲、推高延迟，也会挤压同链路上的其他流量。
 > **只在"线路带宽充足"时使用。**
 
+**④ 高随机丢包档 —— 原默认值**（链路确实是 10%-20% 的**随机**丢包、不是被挤爆的丢包）
+
+```bash
+sudo ssctl set-module-config \
+  --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
+  --max-queue-delay-ms 100 --max-queue-delay-ratio 1.0 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 4 \
+  --min-rtt-window-s 10 --bw-window-rtts 10 \
+  --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 3.0 \
+  --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.1 \
+  --guardrail-gain 0.8 --loss-inflation-max-ratio 0.5
+```
+
+这是 [性能验证报告](04-performance-report.md) 里 `skyline-best` 测的那组系数，针对的是
+"丢包不代表拥塞"的链路：丢包补偿放到最多多发一倍，护栏放得很宽。默认档后来改掉它，
+是因为在并发连接很多、丢包主要来自瓶颈被挤满的生产环境里，这组系数会越丢越发——
+重传明显增多，速度却没有换来。**判断方法**：换档后看重传占比和 RTO 超时数（做法见
+文末「附：视频卡顿 / 大文件传输中断怎么查」），重传涨了而吞吐没涨，就说明你的丢包是
+挤出来的，回默认档。
+
 ### 让档位重启后依然生效
 
 `ssctl set-module-config` 改的是**内存态，重启会丢**。要长期生效，改配置文件：
@@ -208,45 +256,56 @@ sudo cp /etc/skyline-speeder/speeder.toml /etc/skyline-speeder/speeder.toml.bak
 sudo nano /etc/skyline-speeder/speeder.toml
 ```
 
-顶层字段对应 `--max-*` 系列，`[adaptive_cwnd]` 段对应各种 gain，改完：
+命令行参数与配置文件的对应（参数名里的 `-` 换成 `_`）：`--max-pacing-mbps`、`--max-cwnd-packets`、
+`--max-queue-delay-ms`、`--max-queue-delay-ratio`、`--initial-cwnd-packets`、`--min-cwnd-packets` 是顶层字段；
+`--loss-inflation-max-ratio` 在 `[loss_classifier]` 段；其余的（各种 gain、`--min-rtt-window-s`、
+`--bw-window-rtts`、`--startup-plateau-rtts`、`--startup-growth-ratio`）在 `[adaptive_cwnd]` 段。
+
+> [!CAUTION]
+> 0.5.0 起，写错段落或拼错的键会让下面的 `--validate-only` 直接报错，并指出它该放在哪一段；0.4.x 及更早的
+> 版本会**静默忽略**它们，`--validate-only` 照样通过。无论哪个版本，重启之后都用 `sudo ssctl flows` 的
+> PARAMETERS IN FORCE 段落核对一遍。
+
+改完：
 
 ```bash
 # 先校验，不通过就别重启
 sudo skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only
 
-sudo systemctl restart skyline-speederd.service
-sudo systemctl restart skyline-speeder-enable.service
+sudo systemctl restart skyline-speederd.service    # 挂载单元会随之重启并重新挂载
 ```
 
 ### 有硬上限的参数（填超了整组命令会被拒绝）
 
 | 参数 | 允许范围 | 备注 |
 |---|---|---|
-| `--bw-window-rtts` | **1 – 10** | 默认已是 10，**没有加大空间** |
-| `--loss-inflation-max-ratio` | **0 – 0.5** | 默认已是 0.5（BPF 侧硬编码 500‰），**已顶格** |
-| `--guardrail-gain` | 0 – 1.0 | 1.0 = 不降速；0 = 关闭该护栏 |
+| `--bw-window-rtts` | **1 – 10** | 默认 6；10 是硬上限 |
+| `--loss-inflation-max-ratio` | **0 – 0.5** | 默认 0.10；0.5 是 BPF 侧硬编码的上限（500‰） |
+| `--guardrail-gain` | 0 – 1.0 | 1.0 = 只取消加速、不降速；0 的效果和 1.0 一样（不是关掉护栏） |
 | `--startup-growth-ratio` | 0 – 1.0 | |
 | `--startup-gain` / `--cruise-*-gain` | ≥ 1.0 | 无上限，但越大越容易堆队列 |
 | `--max-cwnd-packets` | ≥ 4 | |
+| `--min-cwnd-packets` | **4 – `--max-cwnd-packets`** | 低于 4 会被拒绝（BPF 侧本来就不会让窗口低于 4） |
 
 > 命令是**全量覆盖**的：只要有**任何一个**参数越界，**整条命令都会被拒绝**，
-> 已生效的配置保持不变。返回里会写明是哪个参数、允许范围是多少。
+> 已生效的配置保持不变。返回里写明被拒绝的原因（多数会点名参数和允许范围）。
 
 ### 改参数的正确姿势
 
 ```bash
-# 1. 先看现在是什么
-sudo ssctl status
+# 1. 先看现在是什么（PARAMETERS IN FORCE 段落）
+sudo ssctl flows
 
 # 2. 把所有要保留的值一起写全（这里示范：只想把护栏放松到 0.9）
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
-  --max-queue-delay-ms 100 --max-queue-delay-ratio 1.0 \
-  --initial-cwnd-packets 100 --min-rtt-window-s 10 --bw-window-rtts 10 \
-  --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 3.0 \
-  --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.1 \
+  --max-queue-delay-ms 70 --max-queue-delay-ratio 0.6 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 32 \
+  --min-rtt-window-s 30 --bw-window-rtts 6 \
+  --startup-plateau-rtts 5 --startup-growth-ratio 0.20 --startup-gain 3.0 \
+  --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.25 \
   --guardrail-gain 0.9 \
-  --loss-inflation-max-ratio 0.5
+  --loss-inflation-max-ratio 0.10
 
 # 3. 不满意就一键还原
 sudo ssctl reset-module-config
@@ -270,7 +329,7 @@ sudo ssctl reset-module-config
 > 这个功能靠 `TCP_RTO_MAX_MS`（socket 选项编号 **44**）下发。该编号在 Linux 6.12 里
 > **尚未分配**（该内核最大只到 43 = `TCP_IS_MPTCP`），内核会返回 `ENOPROTOOPT`。
 >
-> 表现是：命令能成功下发、配置也显示已生效，但 `ssctl status` 里
+> 表现是：命令能成功下发、配置也显示已生效，但 `ssctl flows --json` 里
 > **`rack_rto.stats.rto_max_rejected` 持续增长而 `rto_max_applied` 恒为 0**。
 > 我们在 Debian 6.12.101 上实测确认了这一点。
 >
@@ -285,12 +344,13 @@ sudo ssctl reset-module-config
 > 配置留着不会有副作用（只是被内核忽略），升级到 6.15+ 后会自动开始生效。
 
 > [!CAUTION]
-> **只在配置文件里写 `[rack_rto] enabled = true` 是不够的。** daemon 启动时不会把这段
-> 推进 BPF map，必须**显式执行一次 `ssctl set-rack-rto`** 才会真正订阅。
+> **只在配置文件里写 `[rack_rto] enabled = true` 是不够的。** daemon 每次启动都把这项功能清零，
+> 不会把配置文件里的这一段推进 BPF map。要真正打开，执行一次 `sudo ssctl reset-rack-rto`（下发配置文件里
+> 的值），或 `sudo ssctl set-rack-rto ...`（下发命令行给的值，见下）。
 > 实测：仅靠配置文件时 `established_cb` 有 2169，但 `subscribe_ok` / `rtt_callbacks`
 > / `applied` 全是 0；执行命令后才开始增长。
 >
-> 因此**每次重启后都要重跑一次**，或把它加进开机脚本。
+> 因此**每次 daemon 重启后都要重跑一次**，或把它加进开机脚本。
 
 开启：
 
@@ -340,13 +400,17 @@ sudo ssctl set-rack-rto \
 关闭：
 
 ```bash
-sudo ssctl reset-rack-rto
+sudo ssctl set-rack-rto --disable
 ```
+
+（`sudo ssctl reset-rack-rto` 是回到配置文件里 `[rack_rto]` 的设置：出厂配置没有这一段，就是关闭；
+配置文件里写了 `enabled = true` 的，它反而会把功能打开。）
 
 > [!IMPORTANT]
 > **这个功能有个前提：进程必须在指定的 cgroup 里，否则完全不生效，而且不报错。**
 >
-> 检查：`sudo ssctl status` 里如果 `rack_rto.stats.applied` 一直是 0，就是没生效。
+> 检查：`sudo ssctl flows` 的 DYNAMIC RTO 段落里，如果 *connections seen* 一直是 0，就是没生效
+> （它下面会直接写明这不是错误，而是没有进程在那个 cgroup 里）。
 >
 > 让你的服务进入 cgroup：
 > ```bash
@@ -404,6 +468,9 @@ sudo ssctl reset-retransmit-dscp
 ### 补充说明
 
 - 它挂在网卡出方向上，对该网卡**所有 TCP 流量**一致生效，不区分用的是哪种拥塞控制算法。
+- 它只挂在以太网网卡上。配置里的 `runtime.tc_interface` 是 WireGuard / WARP、tun 这类隧道时
+  不会挂载，上面这条开启命令会报错（原因写在 `ssctl status` 的 ATTENTION 段落里）：
+  把 `tc_interface` 改成承载隧道流量的那块物理网卡，再重启 `skyline-speederd`。
 - 它**不受** `ssctl drain` 影响。摘除加速功能时，这个标记仍然在工作，要单独关。
 - IPv4 和 IPv6 都支持，我们实测零误标记。
 
@@ -415,23 +482,75 @@ sudo ssctl reset-retransmit-dscp
 sudo ssctl status
 ```
 
-三件事要对：
+标题右上角直接给结论，只看这一处就够了：
 
 ```
-"enabled": true                      <- 加速已挂载
-"capabilities": { ... 五项全 true }   <- 环境满足要求
-"active_flows": 大于 0                <- 有连接在用
+● ACCELERATING            <- 已挂载，而且是全机默认，新连接都走它
+○ ATTACHED, NOT DEFAULT   <- 挂载了但新连接绕开了它，等于没生效（见下）
+○ STANDBY                 <- 没挂载，跑 sudo ssctl enable
 ```
 
-**光看这个还不够**，再确认真实连接确实在用它（服务器有流量时执行）：
+`ACCELERATING` 之外的两种，报告最下面的 **ATTENTION** 段落会逐条写明问题和对应的处理
+动作。四个关键行也各自带标记：
+
+```
+✔ skyline_cc struct_ops   attached, 3h 12m ago     <- 加速已挂载
+✔ host default cc         skyline_cc               <- 新连接确实走它
+✔ 状态 ARMED（DRIFT GUARD 段落）                    <- 拥塞控制和 qdisc 正被守着
+✔ KERNEL 段落 required 那行全是 ✔                   <- 环境满足要求
+```
+
+再确认真实连接确实在用它（服务器有流量时执行）：
 
 ```bash
-ss -tin | grep -c skyline_cc
+sudo ssctl flows
 ```
 
-大于 0 就说明真的生效了。是 0 的话，可能是已建立的老连接不会中途切换，等新连接即可。
+CONNECTIONS 段落的 coverage 那行会写「多少条 TCP 连接里有多少条跑在 skyline_cc 上」，
+下面逐条列出这些连接。是 0 的话，可能是已建立的老连接不会中途切换，等新连接即可。
 
-> `capabilities` 里 `rack_reo_hook: false` 是**正常的**，不影响使用。
+> KERNEL 段落 optional 那行里 `RACK reorder hook` 是灰点（未命中）是**正常的**，不影响使用。
+> 要原始 JSON（脚本解析、贴报告）就加 `--json`。
+
+### 之前装过「一键 BBR」、改过 qdisc 的机器
+
+不用先卸载它们，也不用手动改回来。`ssctl enable`（安装脚本会自动执行）会：
+
+- 把拥塞控制改成 `skyline_cc`；
+- 把默认 qdisc（`net.core.default_qdisc`）改成 `fq`；
+- 把出口网卡上的 qdisc（`cake`、`fq_pie`、`fq_codel` 等）换成 `fq`——`skyline_cc` 靠 `fq`
+  把数据均匀发出去。出口是 VLAN、bond 或网桥时，换的是它下面的物理网卡（网桥上虚拟机、
+  容器的端口不碰）。
+
+之后 `skyline-speederd` 每 5 秒检查一次，谁改回去就再改过来（比如有脚本又执行了
+`sysctl --system`），并在日志里记一笔：
+
+```bash
+journalctl -u skyline-speederd | grep 'guard:'
+```
+
+带 `something else on this host changed it` 的行反复出现，说明机器上有东西一直在改。
+不影响加速；想根除，就去 `/etc/sysctl.conf`、`/etc/sysctl.d/` 里找写着 `bbr`、`cake` 的
+那一行删掉（安装结束时的摘要会列出这些文件）。
+
+以下情况它**不会动**：
+
+- 网卡上是你自己搭的限速 / 整形 qdisc（`htb`、`tbf`、`netem` 等，以及设了带宽的 `cake`，
+  比如 `cake bandwidth 90Mbit`）——替换会把你的限速配置弄没。`ssctl status` 的 DRIFT GUARD
+  段落里会以 `note` 写明它没动；
+- 出口是内核 WireGuard 这类根为 `noqueue`、下面又找不到物理网卡的设备时——`notes` 里会写
+  `is a virtual device ... no qdisc checked`。想让它管，就把配置里的 `runtime.tc_interface`
+  改成真正的物理网卡（tun 类隧道——WARP 客户端、wireguard-go、OpenVPN——有自己的 qdisc，
+  被设成 `tc_interface` 时照样会被换成 `fq`）；
+- 执行过 `ssctl drain` 之后——摘除即停止守护，qdisc 保持现状（仍是 `fq`）。
+
+不想让它管 qdisc：把 `/etc/skyline-speeder/speeder.toml` 里 `[guard]` 段的 `qdisc` 改成
+`false`，然后：
+
+```bash
+sudo skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only
+sudo systemctl restart skyline-speederd.service
+```
 
 ---
 
@@ -444,12 +563,12 @@ ss -tin | grep -c skyline_cc
 ### 场景 2：想验证到底有没有效果
 
 ```bash
-# 基准：把模块全关（等价于系统原生 CUBIC）
+# 基准：把模块全关（不做任何加速的中性基准）
 sudo ssctl enable --all-off
 # ... 测速 ...
 
-# 全开
-sudo ssctl enable
+# 全开（要把四个模块写全：不带 --modules 的 enable 会沿用刚才的全关）
+sudo ssctl enable --modules early-loss,adaptive-cwnd,loss-classifier,pacing
 # ... 同样条件再测一次 ...
 ```
 
@@ -461,12 +580,13 @@ sudo ssctl enable
 # 更早减速、降得更狠
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
-  --max-queue-delay-ms 50 --max-queue-delay-ratio 1.0 \
-  --initial-cwnd-packets 100 --min-rtt-window-s 10 --bw-window-rtts 10 \
-  --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 3.0 \
-  --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.05 \
+  --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 32 \
+  --min-rtt-window-s 30 --bw-window-rtts 6 \
+  --startup-plateau-rtts 5 --startup-growth-ratio 0.20 --startup-gain 3.0 \
+  --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.05 \
   --guardrail-gain 0.7 \
-  --loss-inflation-max-ratio 0.5
+  --loss-inflation-max-ratio 0.10
 ```
 
 ### 场景 4：连接经常莫名卡死几十秒
@@ -512,28 +632,34 @@ def snmp():
     return d
 a=snmp(); time.sleep(40); b=snmp()
 o=b["Tcp:OutSegs"]-a["Tcp:OutSegs"]; r=b["Tcp:RetransSegs"]-a["Tcp:RetransSegs"]
-print(f"重传率 {r*100/o:.2f}%  RTO超时 {b['TcpExt:TCPTimeouts']-a['TcpExt:TCPTimeouts']} 次")
+# OutSegs 不含重传的报文段，重传占比是 r/(o+r)
+print(f"重传占比 {r*100/(o+r):.2f}%  RTO超时 {b['TcpExt:TCPTimeouts']-a['TcpExt:TCPTimeouts']} 次")
 EOF
 ```
 
-我们在同一台机器上实测三档（每档 40 秒真实业务流量，中位数）：
+我们在同一台机器上实测三档（每档 40 秒真实业务流量，中位数）。这组数据测于默认系数调整
+**之前**：「默认档」是当时的默认值，也就是上面的「④ 高随机丢包档」；「保守档」也是调整前的
+版本。现在的默认档和保守档没有用这个方法重测过，下面「2.7 倍」的结论只适用于激进档与 ④ 的对比。
 
-| 档位 | 重传率 | **RTO 超时 / 40 秒** |
+| 档位 | 重传占比 | **RTO 超时 / 40 秒** |
 |---|---:|---:|
-| 激进档 | 10.1% | **93** |
-| 默认档 | 8.8% | **35** |
-| 保守档 | 6.0% | **25** |
+| 激进档 | 9.2% | **93** |
+| 默认档 | 8.1% | **35** |
+| 保守档 | 5.7% | **25** |
+
+（重传占比由当时按 `重传 ÷ 新发` 记下的 10.1% / 8.8% / 6.0% 换算成 `重传 ÷ 全部发出`，换算不改变排序。）
 
 **激进档的 RTO 超时是默认档的 2.7 倍**，三轮测试全部最高。RTO 超时就是卡顿的直接来源。
 
-**处置：先回默认档**
+**处置：先回默认档**（从 0.3.x 及更早升级、保留了原配置文件的主机上，`reset-module-config` 回到的是那份旧配置；
+要回新默认档，改用不带任何参数的 `sudo ssctl set-module-config`，见 ②）
 
 ```bash
 sudo ssctl reset-module-config
 ```
 
 如果还想要速度，**不要动 `guardrail-gain`**（那是自我保护开关），
-只小幅提 `cruise-pacing-gain`（1.1 → 1.15 → 1.2），每档跑上面的脚本看 RTO 超时数，
+只小幅提 `cruise-pacing-gain`（1.25 → 1.3 → 1.35），每档跑上面的脚本看 RTO 超时数，
 涨得明显就退回去。
 
 ### 第三步：限制死连接的挂起时长
@@ -544,7 +670,7 @@ sudo ssctl reset-module-config
 但**那需要内核 ≥ 6.15**（见第五节）。6.12 上的替代方案是缩短放弃阈值：
 
 ```bash
-cat > /etc/sysctl.d/99-zz-skyline-speeder-retries.conf <<'EOF'
+sudo tee /etc/sysctl.d/99-zz-skyline-speeder-retries.conf >/dev/null <<'EOF'
 net.ipv4.tcp_retries2 = 8
 EOF
 sudo sysctl -p /etc/sysctl.d/99-zz-skyline-speeder-retries.conf
@@ -557,7 +683,7 @@ sudo sysctl -p /etc/sysctl.d/99-zz-skyline-speeder-retries.conf
 ## 九、出问题了怎么退回
 
 ```bash
-# 1. 参数改乱了 -> 还原出厂参数
+# 1. 参数改乱了 -> 还原成配置文件里的参数（从 0.3.x 及更早升级、保留了原配置的主机上是当时的默认值）
 sudo ssctl reset-module-config
 
 # 2. 想暂时不用加速（等现有连接自然结束，不断线）
@@ -566,19 +692,43 @@ sudo ssctl drain --timeout 60
 # 3. 完全停掉
 sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service
 
-# 4. 彻底卸载（配置文件会保留）
+# 4. 彻底卸载：切回 bbr + fq，并卸掉安装时装上的编译工具链（配置文件会保留）
 sudo ./install.sh --uninstall
+
+# 4b. 想回到安装前那台机器用的拥塞控制和 qdisc，而不是 bbr + fq
+sudo ./install.sh --uninstall --restore-pre-install
 ```
 
+卸载做的事：断开前先 drain 掉存量连接，删掉两个 systemd 单元、二进制和 BPF 对象，把机器切到
+**bbr + fq**，再卸掉安装时装上的包（`clang`、`llvm`、`bpftool`、rustup 等）。只卸安装时记录在
+`/etc/skyline-speeder/added-packages` 里的那些，**不会**碰 `iproute2`、`curl`、
+`ca-certificates`、`tar`，不会碰这几个包仍然依赖的库，也不会碰系统标为必需的包；如果 apt 的
+计划显示会连带删掉清单之外的东西，就把造成这件事的那个包单独留下（并告警说明是谁需要它），
+其余照卸；实在凑不出一个不越界的方案时，才一个都不卸、改为把命令打给你自己决定。`/etc/skyline-speeder` 会保留，重装时你调过的
+参数还在。
+
 > [!NOTE]
-> 卸载后 `bpftool struct_ops show` 可能还能看到 `skyline_cc`。**这不是失败**——
+> `bbr` 和 `fq` 是**本次运行时**设置的。本项目从不改 `/etc/sysctl.d` 下的文件，所以重启后
+> 由那里的文件决定用什么。想让 bbr + fq 一直生效，自己写一个文件即可：
+> ```bash
+> printf 'net.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n' \
+>   | sudo tee /etc/sysctl.d/99-zz-skyline-bbr.conf
+> sudo sysctl --system
+> ```
+>
+> 名字要能排在最后：`/etc/sysctl.d` 是按文件名顺序应用的，同名键后写的赢。写完用
+> `sudo ./install.sh --check` 核对一下到底是哪个文件在开机时设这两个键。
+
+> [!NOTE]
+> 卸载后 `bpftool struct_ops show` 可能还能看到 `skyline_cc`（7.1 及以上内核上叫
+> `skyline_cc_txs`）。**这不是失败**——
 > 只要还有连接在用它，内核就不释放。这些连接断开后或重启后会自动消失。
 
 **DSCP 标记和 RTO 调节不受 `drain` 影响**，要单独关：
 
 ```bash
-sudo ssctl reset-retransmit-dscp
-sudo ssctl reset-rack-rto
+sudo ssctl reset-retransmit-dscp     # 回到配置文件的设置：出厂是关闭
+sudo ssctl set-rack-rto --disable
 ```
 
 ---
@@ -588,4 +738,4 @@ sudo ssctl reset-rack-rto
 - [docs/02-interface-reference.md](02-interface-reference.md) —— 每个命令、每个字段的精确定义
 - [docs/03-design.md](03-design.md) —— 算法原理、为什么这么设计
 - [docs/04-performance-report.md](04-performance-report.md) —— 完整测试数据与局限性
-- [DEPLOY.md](../DEPLOY.md) —— 自动化部署与排障
+- [DEPLOY.md](../DEPLOY.md) —— 部署与运维手册：安装、验证、升级、排障、卸载

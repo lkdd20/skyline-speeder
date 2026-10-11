@@ -49,6 +49,11 @@ extern __u32 tcp_slow_start(struct tcp_sock *tp, __u32 acked) __ksym;
 extern void tcp_cong_avoid_ai(struct tcp_sock *tp, __u32 w, __u32 acked) __ksym;
 extern __u32 tcp_reno_undo_cwnd(struct sock *sk) __ksym;
 
+/* Written only by skyline-speederd, which publishes configuration number N
+ * by writing it into config_slots[N & 1] and only then setting config_seq to
+ * N -- see skyline_adopt_config() for why a flow can then take a copy that is
+ * never half old and half new.
+ */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 2);
@@ -61,7 +66,7 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u32);
-} active_config_slot SEC(".maps");
+} config_seq SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_SK_STORAGE);
@@ -99,28 +104,64 @@ static __always_inline struct inet_connection_sock *skyline_icsk(struct sock *sk
     return (struct inet_connection_sock *)sk;
 }
 
-static __always_inline __u32 skyline_active_config_slot(void)
+/* Keeps clang from moving memory accesses across this point. */
+#define skyline_barrier() asm volatile("" ::: "memory")
+
+static __always_inline __u32 *skyline_config_seq_get(void)
 {
     __u32 key = 0;
-    __u32 *slot = bpf_map_lookup_elem(&active_config_slot, &key);
 
-    return slot ? *slot & 1U : 0;
+    return bpf_map_lookup_elem(&config_seq, &key);
 }
 
-static __always_inline const struct skyline_config *skyline_config_get_slot(__u32 slot)
+/* Whether the flow has adopted a configuration this object understands --
+ * flow->config is zero until skyline_adopt_config() first succeeds.
+ */
+static __always_inline bool skyline_has_config(const struct skyline_flow_state *flow)
 {
-    const struct skyline_config *config;
-
-    slot &= 1U;
-    config = bpf_map_lookup_elem(&config_slots, &slot);
-    if (!config || config->abi_version != SKYLINE_ABI_VERSION)
-        return 0;
-    return config;
+    return flow->config.abi_version == SKYLINE_ABI_VERSION;
 }
 
-static __always_inline const struct skyline_config *skyline_config_get(void)
+/* Copies the configuration skyline-speederd published last into
+ * flow->config, or leaves flow->config as it was and returns false.
+ *
+ * The slot config_seq names is never the one being written: skyline-speederd
+ * writes number N into config_slots[N & 1] while config_seq is still N - 1,
+ * and the slot it writes next, N + 1's, is the other one again. So a copy
+ * taken while config_seq stays put is whole. When config_seq moves during the
+ * copy, the slot copied from may be the one now being rewritten, and the copy
+ * is thrown away; the flow tries again at its next round.
+ *
+ * The objects are built for x86 (-D__TARGET_ARCH_x86), where loads are not
+ * reordered with other loads and each map update skyline-speederd makes is a
+ * bpf() system call made after the previous one returned. What remains is
+ * the compiler: the volatile reads and the barriers keep the copy between
+ * the two reads of config_seq. A port to a weakly ordered architecture needs
+ * acquire semantics on both reads.
+ */
+static __always_inline bool skyline_adopt_config(struct skyline_flow_state *flow)
 {
-    return skyline_config_get_slot(skyline_active_config_slot());
+    __u32 *seq_ptr = skyline_config_seq_get();
+    const struct skyline_config *published;
+    struct skyline_config copy;
+    __u32 seq;
+    __u32 slot;
+
+    if (!seq_ptr)
+        return false;
+    seq = *(volatile __u32 *)seq_ptr;
+    slot = seq & 1U;
+    published = bpf_map_lookup_elem(&config_slots, &slot);
+    if (!published)
+        return false;
+    skyline_barrier();
+    __builtin_memcpy(&copy, published, sizeof(copy));
+    skyline_barrier();
+    if (*(volatile __u32 *)seq_ptr != seq || copy.abi_version != SKYLINE_ABI_VERSION)
+        return false;
+    __builtin_memcpy(&flow->config, &copy, sizeof(copy));
+    flow->config_seq = seq;
+    return true;
 }
 
 static __always_inline struct skyline_metrics *skyline_metrics_get(void)
@@ -258,13 +299,12 @@ static __always_inline __u64 skyline_rate_sample_bps(struct tcp_sock *tp,
     return bytes * 8ULL * USEC_PER_SEC / interval;
 }
 
+/* Starts the flow's model over on the configuration skyline_adopt_config()
+ * just put in flow->config.
+ */
 static __always_inline void skyline_reset_generation(struct skyline_flow_state *flow,
-                                                  const struct skyline_config *config,
-                                                  __u32 config_slot,
                                                   struct tcp_sock *tp)
 {
-    flow->generation = config->generation;
-    flow->config_slot = config_slot & 1U;
     flow->mode = SKYLINE_MODE_STARTUP;
     flow->round_count = 0;
     flow->plateau_rounds = 0;
@@ -396,6 +436,30 @@ static __always_inline __u32 skyline_loss_inflation_permille(struct skyline_flow
     return 1000U * 1000U / (1000U - p);
 }
 
+/* Whether a delivery-rate sample that is not app-limited says anything about
+ * the path. One whose interval spans a wait for a timer does not: a
+ * tail-loss probe's SACK covers one packet over PTO + RTT, and the ACK of
+ * a retransmission an RTO sent covers one packet over the backed-off RTO
+ * plus an RTT, where an ACK-clocked sample covers about one RTT. Taken as
+ * bandwidth such a sample reads as a few kbit/s. That matters most at the
+ * start of a connection on a lossy path, when the max filter holds nothing
+ * better and adopts it, and again after bw_window_rtts rounds of nothing
+ * else: M4 then paces at a gain times it -- two packets every second or
+ * two -- and each round measures only what that pace let through, so the
+ * estimate never climbs back on its own (seen on a lossy field path: a
+ * 35 KB response took 20.8 s, a 256 KB one 13.3 s). Leaving the sample out
+ * keeps the filter either empty -- M2 slow-starts and M4 leaves pacing
+ * alone -- or holding the last real estimate. ACK-clocked samples taken in
+ * Recovery or Loss are kept: they cover about one RTT like any other.
+ */
+static __always_inline bool skyline_sample_measures_path(struct tcp_sock *tp,
+                                                     const struct rate_sample *sample)
+{
+    __u64 srtt_us = tp->srtt_us >> 3;
+
+    return !srtt_us || (__u64)sample->interval_us <= 2ULL * srtt_us;
+}
+
 static __always_inline bool skyline_update_model(struct sock *sk,
                                              struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
@@ -444,7 +508,8 @@ static __always_inline bool skyline_update_model(struct sock *sk,
         }
         flow->bw_bps = maximum;
     }
-    if (rate_bps && !sample->is_app_limited) {
+    if (rate_bps && !sample->is_app_limited &&
+        skyline_sample_measures_path(tp, sample)) {
         if (rate_bps > flow->round_rate_bps)
             flow->round_rate_bps = rate_bps;
         if (rate_bps > flow->bw_bps)
@@ -485,6 +550,8 @@ static __always_inline bool skyline_update_model(struct sock *sk,
          * skyline_abi.h.
          */
         flow->queue_clamped = (max_queue_delay && queue_delay > max_queue_delay) || fresh_ce;
+        if (metric)
+            metric->guardrail_rounds++;
         if (flow->queue_clamped) {
             if (metric)
                 metric->guardrail_hits++;
@@ -514,6 +581,19 @@ static __always_inline bool skyline_update_model(struct sock *sk,
     return new_round;
 }
 
+/* M2's cwnd floor -- config->min_cwnd_packets, never below SKYLINE_MIN_CWND
+ * (see skyline_abi.h's min_cwnd_packets doc comment for why a BDP-derived
+ * target alone is too small for thin flows on a lossy path). The max() is
+ * not just defensive: it is what keeps this floor from ever dropping under
+ * the one the M2-off path uses, whatever userspace wrote. M2-on path only --
+ * skyline_grow_cwnd()/skyline_apply_prr()/skyline_set_state() keep the fixed
+ * SKYLINE_MIN_CWND so this knob cannot perturb B1/B2 neutrality.
+ */
+static __always_inline __u32 skyline_min_cwnd(const struct skyline_config *config)
+{
+    return max_t(__u32, config->min_cwnd_packets, SKYLINE_MIN_CWND);
+}
+
 static __always_inline __u32 skyline_bdp_packets(struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
                                              const struct skyline_config *config,
@@ -536,7 +616,7 @@ static __always_inline __u32 skyline_bdp_packets(struct tcp_sock *tp,
     inflation = skyline_loss_inflation_permille(flow, config);
     bytes = bytes * inflation / 1000U;
     packets = bytes / max_t(__u32, tp->mss_cache, 1U);
-    return max_t(__u32, packets, SKYLINE_MIN_CWND);
+    return max_t(__u32, packets, skyline_min_cwnd(config));
 }
 
 /* SKYLINE_FEATURE_AUTO_PACING: kernel-equivalent pacing-rate ceiling for when
@@ -573,6 +653,33 @@ static __always_inline void skyline_apply_auto_pacing_rate(struct sock *sk, stru
     sk->sk_pacing_rate = rate;
 }
 
+/* M4's floor: never pace a flow below one minimum window per round trip --
+ * the pacing counterpart of the cwnd floor (skyline_min_cwnd() with M2 on,
+ * SKYLINE_MIN_CWND without it). skyline_sample_measures_path() keeps the
+ * known kinds of bogus sample out of the bandwidth filter; this is the
+ * backstop for whatever else leaves the filter holding a rate far below what
+ * the window already allows, so that a round M2 sized at min_cwnd packets is
+ * never spread over seconds by pacing. It is applied after the guardrail's
+ * gain, the same way skyline_set_cwnd_target() applies the cwnd floor last.
+ * 32 packets of 1448 bytes over 85 ms is 4.4 Mbit/s, so on the paths this
+ * controller targets it only binds when the estimate is broken.
+ */
+static __always_inline __u64 skyline_pacing_floor_bps(struct tcp_sock *tp,
+                                                  struct skyline_flow_state *flow,
+                                                  const struct skyline_config *config)
+{
+    __u64 rtt_us = skyline_base_rtt_us(flow);
+    __u32 packets = (config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND)
+                        ? skyline_min_cwnd(config)
+                        : SKYLINE_MIN_CWND;
+
+    if (!rtt_us)
+        rtt_us = tp->srtt_us >> 3;
+    if (!rtt_us)
+        return 0;
+    return (__u64)packets * max_t(__u32, tp->mss_cache, 1U) * 8ULL * USEC_PER_SEC / rtt_us;
+}
+
 static __always_inline void skyline_apply_pacing(struct sock *sk,
                                              struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
@@ -580,6 +687,7 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
 {
     __u32 gain = config->cruise_pacing_permille;
     __u64 rate;
+    __u64 floor_bps;
     struct skyline_metrics *metric;
 
     if (!(config->feature_mask & SKYLINE_FEATURE_PACING)) {
@@ -614,6 +722,9 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
         gain = config->guardrail_gain_permille ? config->guardrail_gain_permille : 1000U;
 
     rate = flow->bw_bps * gain / 1000U;
+    floor_bps = skyline_pacing_floor_bps(tp, flow, config);
+    if (rate < floor_bps)
+        rate = floor_bps;
     if (config->max_pacing_bps && rate > config->max_pacing_bps)
         rate = config->max_pacing_bps;
     rate /= 8ULL;
@@ -637,7 +748,7 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
 static __always_inline void skyline_set_cwnd_target(struct tcp_sock *tp,
                                                 struct skyline_flow_state *flow,
                                                 const struct skyline_config *config,
-                                                __u32 acked)
+                                                __u32 acked, bool after_rto)
 {
     __u32 gain;
     __u32 target;
@@ -650,19 +761,60 @@ static __always_inline void skyline_set_cwnd_target(struct tcp_sock *tp,
          */
         if (acked)
             tcp_slow_start(tp, acked);
+        /* tcp_slow_start() adds every ACKed packet, whether or not the
+         * window was what limited the flow, so a flow that stays app-limited
+         * keeps growing it -- and app-limited flows are the ones that never
+         * get a bandwidth estimate and stay in this branch. The cap holds
+         * here as it does on every other path (skyline_grow_cwnd() on the
+         * M2-off path applies it after tcp_slow_start() too).
+         */
+        if (config->max_cwnd_packets && tp->snd_cwnd > config->max_cwnd_packets)
+            tp->snd_cwnd = config->max_cwnd_packets;
+        /* ...but not from the single packet an RTO leaves behind.
+         * tcp_enter_loss() sets snd_cwnd to packets_in_flight + 1 before
+         * cong_control runs again, and a flow can spend its whole life in
+         * this branch: a response that fits in its first flight goes out
+         * with the window not full and nothing left to send, the kernel
+         * marks its rate samples app-limited, and skyline_update_model()
+         * only takes samples that are not -- so bw_bps typically stays zero
+         * for the life of the flow. Without this floor such a flow
+         * slow-starts the rest of its response back up from one packet
+         * after a timeout -- the one place where "never reduce because of
+         * loss" did not hold. The retransmissions this ACK releases
+         * (tcp_xmit_recovery() runs after cong_control) go out under the
+         * floor. Gated on TCP_CA_Loss so the start of a connection keeps
+         * whatever initial window the kernel or initial_cwnd_packets chose,
+         * a deliberately small one included. Outside Loss there is
+         * nothing to undo: for a cong_control algorithm the kernel skips
+         * PRR (tcp_cong_control()), the reset to ssthresh at the end of
+         * recovery (tcp_end_cwnd_reduction()) and both idle decays
+         * (tcp_slow_start_after_idle_check(), tcp_cwnd_validate()).
+         */
+        if (after_rto && tp->snd_cwnd < skyline_min_cwnd(config))
+            tp->snd_cwnd = skyline_min_cwnd(config);
         return;
     }
     gain = flow->mode == SKYLINE_MODE_STARTUP ? config->startup_gain_permille
                                           : config->cruise_inflight_permille;
-    /* Guardrail wins: see skyline_apply_pacing()'s matching comment. */
+    /* The guardrail takes the mode gain's place here as it does for the
+     * pacing rate, but skyline_bdp_packets() still multiplies in M3's loss
+     * inflation afterwards: the target is BDP x guardrail gain x 1/(1-p),
+     * while the pacing rate is bw_bps x guardrail gain, without the
+     * inflation (see guardrail_gain_permille's doc comment in skyline_abi.h).
+     */
     if (flow->queue_clamped)
         gain = config->guardrail_gain_permille ? config->guardrail_gain_permille : 1000U;
     target = skyline_bdp_packets(tp, flow, config, gain);
     tp->snd_cwnd = target;
     if (config->max_cwnd_packets && tp->snd_cwnd > config->max_cwnd_packets)
         tp->snd_cwnd = config->max_cwnd_packets;
-    if (tp->snd_cwnd < SKYLINE_MIN_CWND)
-        tp->snd_cwnd = SKYLINE_MIN_CWND;
+    /* Floor last, so it holds even against the guardrail's gain clamp above
+     * -- same ordering the fixed SKYLINE_MIN_CWND floor always had here.
+     * Userspace validation keeps min_cwnd_packets <= max_cwnd_packets, so
+     * this can never undo the cap just applied.
+     */
+    if (tp->snd_cwnd < skyline_min_cwnd(config))
+        tp->snd_cwnd = skyline_min_cwnd(config);
 }
 
 /* M2-off path only (B1/B2 neutrality) -- real CUBIC's growth curve plus its
@@ -824,28 +976,37 @@ void BPF_PROG(skyline_init, struct sock *sk)
 {
     struct tcp_sock *tp = skyline_tcp_sk(sk);
     struct skyline_flow_state *flow = skyline_flow_get(sk);
-    __u32 config_slot = skyline_active_config_slot();
-    const struct skyline_config *config = skyline_config_get();
     __u64 *count;
 
-    if (!flow || !config)
+    if (!flow)
         return;
     flow->neutral_pacing_rate = sk->sk_pacing_rate;
     flow->neutral_pacing_status = sk->sk_pacing_status;
-    /* Aggressive initial window, applied before skyline_reset_generation()
-     * snapshots tp->snd_cwnd into prior_cwnd/w_max/tcp_cwnd below -- see
-     * skyline_abi.h's initial_cwnd_packets doc comment. 0 = leave the kernel's
-     * own IW alone.
+    /* Counted whether or not a configuration is adopted below: the socket
+     * holds the struct_ops either way, and drain waits for it.
      */
-    if (config->initial_cwnd_packets)
-        tp->snd_cwnd = config->initial_cwnd_packets;
-    skyline_reset_generation(flow, config, config_slot, tp);
     if (!flow->counted) {
         count = skyline_flow_count_get();
         if (count)
             __sync_fetch_and_add(count, 1);
         flow->counted = 1;
     }
+    /* Fails when nothing this object understands has been published, and in
+     * the rare case that skyline-speederd publishes during the copy. The
+     * flow then keeps the configuration the handshake's ACK adopted, if it
+     * did (see skyline_cong_control()), or adopts one at its next ACK --
+     * either way without the initial window below.
+     */
+    if (!skyline_adopt_config(flow))
+        return;
+    /* Aggressive initial window, applied before skyline_reset_generation()
+     * snapshots tp->snd_cwnd into prior_cwnd/w_max/tcp_cwnd below -- see
+     * skyline_abi.h's initial_cwnd_packets doc comment. 0 = leave the kernel's
+     * own IW alone.
+     */
+    if (flow->config.initial_cwnd_packets)
+        tp->snd_cwnd = flow->config.initial_cwnd_packets;
+    skyline_reset_generation(flow, tp);
     tp->snd_ssthresh = 0x7fffffffU;
 }
 
@@ -857,31 +1018,45 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
     struct inet_connection_sock *icsk = skyline_icsk(sk);
     struct skyline_flow_state *flow = skyline_flow_get(sk);
     const struct skyline_config *config;
-    __u32 active_slot = skyline_active_config_slot();
     struct skyline_metrics *metric;
 
     if (!flow || !sample)
         return;
-    config = skyline_config_get_slot(flow->config_slot);
-    if (!config)
-        config = skyline_config_get();
-    if (!config)
-        return;
-    if (flow->config_slot != active_slot &&
-        (__u64)sample->prior_delivered >= flow->next_round_delivered) {
-        const struct skyline_config *next_config =
-            skyline_config_get_slot(active_slot);
+    if (!skyline_has_config(flow)) {
+        /* No configuration yet. Every connection comes through here once
+         * before skyline_init() has run: the ACK that completes the
+         * handshake goes through tcp_ack(), and so through cong_control,
+         * before tcp_init_transfer() calls init -- on both ends, measured on
+         * 6.12 and 7.2. (0.4.x read the empty state it created here as a
+         * flow on slot 0, and while slot 1 was the active one it logged a
+         * GENERATION_SWITCH from generation 0 for every new connection.)
+         * Later, only after an init that adopted nothing (see there). Take
+         * the configuration now, without waiting for a round, since there is
+         * no old one to finish the round on; init starts the model over
+         * right after anyway. Still nothing: leave this ACK alone.
+         */
+        if (!skyline_adopt_config(flow))
+            return;
+        skyline_reset_generation(flow, tp);
+    } else if ((__u64)sample->prior_delivered >= flow->next_round_delivered) {
+        /* A newer configuration is adopted only here, at a round boundary,
+         * so that no round runs on a mix of two. If several were published
+         * during the round, the latest is the one adopted.
+         */
+        __u32 *seq = skyline_config_seq_get();
 
-        if (next_config) {
-            __u32 old_generation = flow->generation;
+        if (seq && *(volatile __u32 *)seq != flow->config_seq) {
+            __u32 old_generation = flow->config.generation;
             __u32 prior_mode = flow->mode;
 
-            config = next_config;
-            skyline_reset_generation(flow, config, active_slot, tp);
-            skyline_emit(sk, SKYLINE_EVENT_GENERATION_SWITCH, prior_mode,
-                     old_generation, next_config->generation);
+            if (skyline_adopt_config(flow)) {
+                skyline_reset_generation(flow, tp);
+                skyline_emit(sk, SKYLINE_EVENT_GENERATION_SWITCH, prior_mode,
+                         old_generation, flow->config.generation);
+            }
         }
     }
+    config = &flow->config;
 
     skyline_update_model(sk, tp, flow, config, sample);
     metric = skyline_metrics_get();
@@ -912,7 +1087,8 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
      * path unchanged (B1/B2 neutrality).
      */
     if (config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND) {
-        skyline_set_cwnd_target(tp, flow, config, sample->acked_sacked);
+        skyline_set_cwnd_target(tp, flow, config, sample->acked_sacked,
+                                icsk->icsk_ca_state == TCP_CA_Loss);
     } else if (icsk->icsk_ca_state < TCP_CA_CWR) {
         skyline_grow_cwnd(tp, flow, config, sample->acked_sacked);
     } else if (config->feature_mask & SKYLINE_FEATURE_PRR) {
@@ -923,7 +1099,7 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
         metric->ack_events++;
         metric->delivered_packets += max_t(int, sample->delivered, 0);
         if (config->max_cwnd_packets && tp->snd_cwnd >= config->max_cwnd_packets)
-            metric->guardrail_hits++;
+            metric->cwnd_cap_hits++;
     }
 }
 
@@ -932,15 +1108,12 @@ __u32 BPF_PROG(skyline_ssthresh, struct sock *sk)
 {
     struct tcp_sock *tp = skyline_tcp_sk(sk);
     struct skyline_flow_state *flow = skyline_flow_get(sk);
-    const struct skyline_config *config = flow
-                                          ? skyline_config_get_slot(flow->config_slot)
-                                          : skyline_config_get();
 
     /* No-flow/no-config fallback: the fixed CUBIC-beta cut (0.70*cwnd),
-     * matching the M2-off path below -- neither `flow` nor `config` (both
-     * required for the M2-on identity check) exist on this path.
+     * matching the M2-off path below -- neither `flow` nor its configuration
+     * (both required for the M2-on identity check) exist on this path.
      */
-    if (!flow || !config)
+    if (!flow || !skyline_has_config(flow))
         return max_t(__u32, tp->snd_cwnd * SKYLINE_CUBIC_BETA_PERMILLE / 1000U, 2U);
     flow->prior_cwnd = tp->snd_cwnd;
     flow->w_max = tp->snd_cwnd;
@@ -951,7 +1124,7 @@ __u32 BPF_PROG(skyline_ssthresh, struct sock *sk)
      * skyline_set_cwnd_target()/skyline_apply_pacing()'s gain clamp, not through
      * ssthresh. M2 off keeps the exact CUBIC-beta cut (B1/B2 neutrality).
      */
-    if (config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND)
+    if (flow->config.feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND)
         return max_t(__u32, tp->snd_cwnd, 2U);
     return max_t(__u32, tp->snd_cwnd * SKYLINE_CUBIC_BETA_PERMILLE / 1000U, 2U);
 }
@@ -981,7 +1154,6 @@ void BPF_PROG(skyline_set_state, struct sock *sk, __u8 new_state)
 {
     struct skyline_flow_state *flow = skyline_flow_get(sk);
     struct tcp_sock *tp;
-    const struct skyline_config *config;
 
     if (!flow)
         return;
@@ -1007,32 +1179,47 @@ void BPF_PROG(skyline_set_state, struct sock *sk, __u8 new_state)
         if (!flow->recovery_active)
             return;
         flow->recovery_active = 0;
-        config = skyline_config_get_slot(flow->config_slot);
-        if (!config)
-            config = skyline_config_get();
         /* M2 on: cwnd is driven every ACK by skyline_set_cwnd_target()
          * regardless of CA state (see skyline_cong_control()) -- nothing to
          * restore here, the very next ACK already sets the right value.
          * M2 off: mirrors real CUBIC's tcp_end_cwnd_reduction(), which snaps
          * cwnd to ssthresh the moment PRR stops governing it -- required
-         * for B1/B2 neutrality.
+         * for B1/B2 neutrality. A flow with no configuration is one
+         * skyline_cong_control() leaves alone, so neither applies.
          */
-        if (config && !(config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND)) {
+        if (skyline_has_config(flow) &&
+            !(flow->config.feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND)) {
             tp = skyline_tcp_sk(sk);
             tp->snd_cwnd = max_t(__u32, tp->snd_ssthresh, SKYLINE_MIN_CWND);
         }
     }
 }
 
-SEC("struct_ops")
-void BPF_PROG(skyline_cwnd_event, struct sock *sk, enum tcp_ca_event event)
+/* CA_EVENT_TX_START: the first send after the connection went idle (nothing
+ * in flight). Only the M2-off CUBIC core reads epoch_start_ns. */
+static __always_inline void skyline_tx_start(struct sock *sk)
 {
     struct skyline_flow_state *flow = skyline_flow_get(sk);
 
-    if (!flow)
-        return;
-    if (event == CA_EVENT_TX_START)
+    if (flow)
         flow->epoch_start_ns = bpf_ktime_get_ns();
+}
+
+SEC("struct_ops")
+void BPF_PROG(skyline_cwnd_event, struct sock *sk, enum tcp_ca_event event)
+{
+    if (event == CA_EVENT_TX_START)
+        skyline_tx_start(sk);
+}
+
+/* Linux 7.1 gave CA_EVENT_TX_START an op of its own: tcp_ca_event()
+ * (include/net/tcp.h) hands it to cwnd_event_tx_start and returns, so
+ * cwnd_event never sees it there and skyline_cwnd_event() above has nothing
+ * left to do. Upstream CUBIC moved its TX_START handling the same way. */
+SEC("struct_ops")
+void BPF_PROG(skyline_cwnd_event_tx_start, struct sock *sk)
+{
+    skyline_tx_start(sk);
 }
 
 SEC("struct_ops")
@@ -1057,6 +1244,48 @@ struct tcp_congestion_ops skyline_cc = {
     .undo_cwnd = (void *)skyline_undo_cwnd,
     .set_state = (void *)skyline_set_state,
     .cwnd_event = (void *)skyline_cwnd_event,
+    .cong_control = (void *)skyline_cong_control,
+    .name = "skyline_cc",
+};
+
+/* The same algorithm for kernels whose tcp_congestion_ops has
+ * cwnd_event_tx_start (Linux 7.1+). It cannot be a member of skyline_cc
+ * above: libbpf refuses a struct_ops map that sets a member the running
+ * kernel lacks, so on 6.12 that map would not load at all. A second map
+ * with its own type takes it instead, and skyline-speederd creates exactly
+ * one of the two (BpfRuntime::load, by the kernel's BTF).
+ *
+ * The type is local and lists only the members set here: libbpf strips the
+ * ___tx_start suffix to find the kernel's struct and matches members by
+ * name, not by offset, so it needs no vmlinux.h that knows the new member
+ * (the 6.12 reference header the release objects are built from does not).
+ * name[] has the kernel's TCP_CA_NAME_MAX (16) entries; libbpf checks the
+ * size of every data member it copies.
+ *
+ * "?" leaves the map uncreated unless the loader asks for it, so a loader
+ * that predates it -- or plain libbpf on any kernel -- still loads the
+ * object with skyline_cc alone. The map name is short enough for the 15
+ * characters the kernel keeps of one (BPF_OBJ_NAME_LEN), so bpftool shows it
+ * whole; the algorithm both register is "skyline_cc". */
+struct tcp_congestion_ops___tx_start {
+    void (*init)(struct sock *sk);
+    void (*release)(struct sock *sk);
+    __u32 (*ssthresh)(struct sock *sk);
+    __u32 (*undo_cwnd)(struct sock *sk);
+    void (*set_state)(struct sock *sk, __u8 new_state);
+    void (*cwnd_event_tx_start)(struct sock *sk);
+    void (*cong_control)(struct sock *sk, __u32 ack, int flag, const struct rate_sample *rs);
+    char name[16];
+};
+
+SEC("?.struct_ops")
+struct tcp_congestion_ops___tx_start skyline_cc_txs = {
+    .init = (void *)skyline_init,
+    .release = (void *)skyline_release,
+    .ssthresh = (void *)skyline_ssthresh,
+    .undo_cwnd = (void *)skyline_undo_cwnd,
+    .set_state = (void *)skyline_set_state,
+    .cwnd_event_tx_start = (void *)skyline_cwnd_event_tx_start,
     .cong_control = (void *)skyline_cong_control,
     .name = "skyline_cc",
 };

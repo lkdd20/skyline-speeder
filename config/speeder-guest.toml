@@ -7,35 +7,44 @@ prr_pacing_enabled = true
 # See config/speeder.toml's comment: kernel-equivalent pacing-rate ceiling used
 # when M4 is off, same independent-switch shape as prr_pacing_enabled.
 auto_pacing_enabled = true
+# See config/speeder.toml's comment: what new connections get while
+# skyline_cc is detached. install.sh sets it, in a config it creates, to the
+# algorithm the host boots into.
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000
-max_queue_delay_ms = 100
+max_queue_delay_ms = 70
 # See config/speeder.toml's comment: RTT-relative queue guardrail ratio.
-max_queue_delay_ratio = 1.0
+max_queue_delay_ratio = 0.6
 # See config/speeder.toml's comment: aggressive initial window.
 initial_cwnd_packets = 100
+# See config/speeder.toml's comment: floor under M2's cwnd target.
+min_cwnd_packets = 32
 
 # 这两段的默认值可能被实验矩阵通过 `ssctl set-module-config`（见
 # research/experiments/run_matrix.py 的 apply_module_config()）逐 case 覆盖；
 # 不像 [rack_tuning] 那样有"guest 必须整段省略"的强约束，因为这里走的是
 # skyline-speederd 自己管理的内存态配置，不存在被外部 sysctl 写入绕过的风险。
-# See config/speeder.toml's comment for the full rationale (targeting the
-# 10-20% loss / 100-300ms RTT deployment box).
+# See config/speeder.toml's comment for the full rationale. On an installed
+# host these are the live defaults: both install paths ship this file as
+# /etc/skyline-speeder/speeder.toml. In the experiment matrix they only matter
+# for a case that does not override them: the matrix's own coefficient defaults
+# (research/experiments/matrix_lib.py) stay pinned to the set
+# docs/04-performance-report.md measured, so that report stays reproducible.
 [adaptive_cwnd]
-min_rtt_window_s = 10
-bw_window_rtts = 10
-startup_plateau_rtts = 3
-startup_growth_ratio = 0.25
+min_rtt_window_s = 30
+bw_window_rtts = 6
+startup_plateau_rtts = 5
+startup_growth_ratio = 0.20
 startup_gain = 3.0
-cruise_inflight_gain = 2.0
-cruise_pacing_gain = 1.1
+cruise_inflight_gain = 3.0
+cruise_pacing_gain = 1.25
 # See config/speeder.toml's comment: queue-delay/ECN guardrail cut.
 guardrail_gain = 0.8
 
 [loss_classifier]
 # See config/speeder.toml's comment: single loss-rate compensation factor.
-loss_inflation_max_ratio = 0.5
+loss_inflation_max_ratio = 0.10
 
 # [rack_tuning] 必须整段保持注释：这台 guest 由实验矩阵
 # （infra/apply-guest-profile.sh）逐 case 精确控制 tcp_recovery/
@@ -47,6 +56,36 @@ loss_inflation_max_ratio = 0.5
 # research/experiments/run_matrix.py 的 apply_profile()），这里同样保持默认
 # 关闭（enabled=false），不在配置文件里设置具体数值。
 
+# First-flight redundancy: while skyline_cc is enabled, every SYN-ACK, every
+# SYN of a skyline_cc socket and every segment in the first first_kib KiB a
+# skyline_cc connection sends goes out twice, the copy delay_ms later (held
+# by fq). It trades those bytes for not waiting on loss recovery -- see
+# config/speeder.toml and docs/03-design.md section 9. The experiment matrix
+# turns it off per case (research/experiments/run_matrix.py), since every
+# docs/04-performance-report.md case ran without copies.
+[redundancy]
+enabled = true
+first_kib = 64   # 1..=1024
+delay_ms = 10    # 0..=100
+
+# While skyline_cc is enabled, skyline-speederd re-checks every interval_s
+# seconds that the host default congestion control is still skyline_cc and (if
+# qdisc = true) that net.core.default_qdisc and the root qdisc of
+# runtime.tc_interface are still fq, and puts back whatever something else
+# changed -- a `sysctl --system` that re-applies a "one-click BBR" file, a tc
+# command that installs cake/fq_pie. `ssctl enable` applies all of it once
+# regardless. 0 turns the periodic re-check off. A root qdisc that looks built
+# on purpose (htb, tbf, netem, prio, mqprio, a cake with a bandwidth, ...) is
+# left alone and reported under "guard" in `ssctl status`; `ssctl drain` stops
+# the guard. When runtime.tc_interface is a VLAN, bond or bridge (root noqueue,
+# the kernel default there), the NICs under it are checked instead -- never a
+# VM's tap or a container's veth.
+[guard]
+interval_s = 5
+# false leaves every qdisc alone (skyline-speederd then owns only the
+# congestion control).
+qdisc = true
+
 [runtime]
 bpf_dir = "/opt/skyline-speeder/bpf"
 pin_dir = "/sys/fs/bpf/skyline-speeder"
@@ -54,4 +93,8 @@ cgroup_path = "/sys/fs/cgroup/skyline-speeder"
 socket_path = "/run/skyline-speeder/speeder.sock"
 state_path = "/run/skyline-speeder/state.json"
 events_path = "/run/skyline-speeder/events.jsonl"
+# /run is a RAM-backed tmpfs shared with the rest of the host. Past this many
+# MiB the event log is rotated to events.jsonl.1 (one old file kept), so it
+# never holds much more than twice this. 0 turns the event log off.
+events_max_mib = 8
 tc_interface = "data0"

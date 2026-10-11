@@ -1,19 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 CYBERVERSE LLC
+mod style;
+mod view;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use skyline_common::{
-    Module, ModuleTuningConfig, RackRtoConfig, Request, Response, RetransmitDscpConfig,
+    Module, ModuleTuningConfig, RackRtoConfig, RedundancyConfig, Request, Response,
+    RetransmitDscpConfig,
 };
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use style::{ColorChoice, Theme};
 
 #[derive(Debug, Parser)]
-#[command(about = "Control the Skyline Speeder experimental daemon")]
+#[command(
+    version,
+    about = "Control the Skyline Speeder daemon",
+    after_help = concat!(
+        "Skyline Speeder is exclusively sponsored by Skyline Connect -- ",
+        "https://www.skylineconnect.io"
+    )
+)]
 struct Arguments {
     #[arg(long, default_value = "/run/skyline-speeder/speeder.sock")]
     socket: PathBuf,
+    /// Print the daemon's reply as JSON instead of the readable report.
+    /// This is the pre-0.3.0 output, byte for byte, for scripts that parse
+    /// it.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Colour and symbols: auto (a terminal, and NO_COLOR unset), always,
+    /// never.
+    #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
     #[command(subcommand)]
     command: Command,
 }
@@ -21,6 +42,12 @@ struct Arguments {
 #[derive(Debug, Subcommand)]
 enum Command {
     Validate,
+    /// Attach skyline_cc, make it the host default, and arm the guard.
+    ///
+    /// The guard puts the congestion control -- and, with [guard] qdisc =
+    /// true, net.core.default_qdisc and runtime.tc_interface's root qdisc
+    /// (fq) -- back whenever something else changes them, until `drain`. The
+    /// response message lists everything this enable corrected.
     Enable {
         #[arg(long, value_delimiter = ',')]
         modules: Option<Vec<Module>>,
@@ -31,11 +58,27 @@ enum Command {
         #[arg(long)]
         module: Module,
     },
+    /// Is Skyline Speeder running, and has it taken this host over?
+    ///
+    /// Attachment, the host's default congestion control, the drift guard,
+    /// kernel support and the global sysctls -- the state of the takeover,
+    /// not of the traffic. For the traffic, see `flows`.
     Status,
+    /// What is being accelerated, and with which parameters?
+    ///
+    /// The TCP connections the kernel currently runs on skyline_cc, the
+    /// coefficients in force on them, and the counters showing what the
+    /// algorithm decided. For whether the takeover is healthy, see
+    /// `status`.
+    #[command(visible_alias = "flow")]
     Flows,
     Snapshot {
         path: PathBuf,
     },
+    /// Move new connections back to fallback_cc, disarm the guard, detach.
+    ///
+    /// Waits up to --timeout seconds for skyline_cc flows to finish before
+    /// unregistering it. Qdiscs are left as they are.
     Drain {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
@@ -78,8 +121,9 @@ enum Command {
     /// M2 ([adaptive_cwnd]) / M3 ([loss_classifier]) coefficients, plus the
     /// top-level safety limits. Absolute-replace semantics, same as
     /// SetRackRto -- every field is always sent. Defaults below match
-    /// config/speeder.toml's current values (kept in sync by hand, same as
-    /// SetRackRto's defaults). M2 is a two-mode (STARTUP/CRUISE)
+    /// config/speeder.toml's current values; the
+    /// `set_module_config_defaults_match_the_shipped_config` test fails if
+    /// the two drift apart. M2 is a two-mode (STARTUP/CRUISE)
     /// rate-driven controller, M3 a single loss-rate compensation factor
     /// -- see bpf/include/skyline_abi.h's top-of-file comment.
     SetModuleConfig {
@@ -87,34 +131,40 @@ enum Command {
         max_pacing_mbps: u64,
         #[arg(long, default_value_t = 50_000)]
         max_cwnd_packets: u32,
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 70)]
         max_queue_delay_ms: u32,
         /// Ratio of base RTT added to max-queue-delay-ms to form the actual
         /// guardrail (max of the two). 0.0 keeps the guardrail exactly at
         /// max-queue-delay-ms.
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 0.6)]
         max_queue_delay_ratio: f64,
         /// Aggressive initial window (packets). 0 leaves the kernel's
         /// own IW alone.
         #[arg(long, default_value_t = 100)]
         initial_cwnd_packets: u32,
-        #[arg(long, default_value_t = 10)]
+        /// Floor under M2's BDP-derived cwnd target (packets), 4 or more.
+        /// Pacing still sets the send rate; this only keeps a thin flow's
+        /// window large enough to recover from a loss without an RTO, and
+        /// is where a short response restarts after one.
+        #[arg(long, default_value_t = 32)]
+        min_cwnd_packets: u32,
+        #[arg(long, default_value_t = 30)]
         min_rtt_window_s: u32,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 6)]
         bw_window_rtts: u32,
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 5)]
         startup_plateau_rtts: u32,
-        #[arg(long, default_value_t = 0.25)]
+        #[arg(long, default_value_t = 0.20)]
         startup_growth_ratio: f64,
         /// SKYLINE_MODE_STARTUP's single gain (cwnd target and pacing rate both
         /// use it while M2 is on).
         #[arg(long, default_value_t = 3.0)]
         startup_gain: f64,
         /// SKYLINE_MODE_CRUISE's cwnd-target gain.
-        #[arg(long, default_value_t = 2.0)]
+        #[arg(long, default_value_t = 3.0)]
         cruise_inflight_gain: f64,
         /// SKYLINE_MODE_CRUISE's pacing-rate gain.
-        #[arg(long, default_value_t = 1.1)]
+        #[arg(long, default_value_t = 1.25)]
         cruise_pacing_gain: f64,
         /// Gain applied to both cwnd and pacing for the rest of a round in
         /// which the queue-delay/ECN guardrail trips. 0.0 keeps the
@@ -125,7 +175,7 @@ enum Command {
         /// Ceiling on the measured per-flow loss rate to compensate for when
         /// inflating BDP-derived targets/pacing rate. 0.0 disables this
         /// (inflation always exactly 1.0x).
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.10)]
         loss_inflation_max_ratio: f64,
         /// Turn off the PRR-style continuous recovery-phase rate limiting
         /// (on by default, independent of --modules -- see
@@ -161,6 +211,28 @@ enum Command {
     /// Restore [retransmit_dscp] to whatever the configuration file
     /// declared at daemon startup (disabled, unless explicitly configured).
     ResetRetransmitDscp,
+    /// First-flight redundancy: while skyline_cc is enabled, send every
+    /// SYN-ACK, every SYN of a skyline_cc socket and every segment in the
+    /// first --first-kib KiB of a skyline_cc connection twice, the copy
+    /// --delay-ms after the original. Absolute-replace semantics, same as
+    /// SetRackRto: every field is sent, so an omitted flag means its default
+    /// here, not "unchanged".
+    SetRedundancy {
+        /// Turn it off.
+        #[arg(long)]
+        disable: bool,
+        /// Copy segments that start within this many KiB (1-1024) of what
+        /// the connection has sent.
+        #[arg(long, default_value_t = 64)]
+        first_kib: u32,
+        /// How long after the original the copy leaves (0-100; 0 = right
+        /// behind it).
+        #[arg(long, default_value_t = 10)]
+        delay_ms: u32,
+    },
+    /// Restore [redundancy] to whatever the configuration file declared at
+    /// daemon startup (on, unless explicitly configured otherwise).
+    ResetRedundancy,
 }
 
 fn request(command: Command) -> Request {
@@ -202,6 +274,7 @@ fn request(command: Command) -> Request {
             max_queue_delay_ms,
             max_queue_delay_ratio,
             initial_cwnd_packets,
+            min_cwnd_packets,
             min_rtt_window_s,
             bw_window_rtts,
             startup_plateau_rtts,
@@ -220,6 +293,7 @@ fn request(command: Command) -> Request {
                 max_queue_delay_ms,
                 max_queue_delay_ratio,
                 initial_cwnd_packets,
+                min_cwnd_packets,
                 min_rtt_window_s,
                 bw_window_rtts,
                 startup_plateau_rtts,
@@ -241,23 +315,274 @@ fn request(command: Command) -> Request {
             },
         },
         Command::ResetRetransmitDscp => Request::ResetRetransmitDscp,
+        Command::SetRedundancy {
+            disable,
+            first_kib,
+            delay_ms,
+        } => Request::SetRedundancy {
+            config: RedundancyConfig {
+                enabled: !disable,
+                first_kib,
+                delay_ms,
+            },
+        },
+        Command::ResetRedundancy => Request::ResetRedundancy,
     }
 }
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let mut stream = UnixStream::connect(&arguments.socket)
-        .with_context(|| format!("connect to {}", arguments.socket.display()))?;
-    serde_json::to_writer(&mut stream, &request(arguments.command))?;
+    let theme = Theme::detect(arguments.color);
+    let mut stream = UnixStream::connect(&arguments.socket).with_context(|| {
+        format!(
+            "connect to {} (is skyline-speederd running?)",
+            arguments.socket.display()
+        )
+    })?;
+    let request = request(arguments.command);
+    let wants = View::of(&request);
+    serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;
 
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     let response: Response = serde_json::from_str(line.trim()).context("decode daemon response")?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+
+    if arguments.json {
+        // Unchanged from 0.2.0, deliberately: this is what install.sh, the
+        // health checks in DEPLOY.md and any monitoring built on them read.
+        // The sponsor line goes to stderr so stdout stays pure JSON, and
+        // only to a terminal -- see `stderr_is_terminal`.
+        emit(&format!("{}\n", serde_json::to_string_pretty(&response)?))?;
+        if theme.stderr_is_terminal() {
+            eprintln!("{}", view::sponsor(&theme));
+        }
+    } else {
+        emit(&wants.render(&theme, &response))?;
+    }
     if response.ok {
         Ok(())
     } else {
-        anyhow::bail!("{}", response.message)
+        // The message is already on screen in both modes; repeating it as
+        // the process error would print it twice.
+        std::process::exit(1);
+    }
+}
+
+/// Writes a report to stdout. A reader that has what it wanted may close the
+/// pipe before the end (`ssctl --json flows | head -1`, `| grep -q
+/// ACCELERATING`); `print!` turns the EPIPE that follows into a panic and exit
+/// status 101, which reads as a crash and, under `set -o pipefail`, fails a
+/// check that in fact succeeded. Nothing is lost that anyone was reading, so
+/// a closed pipe ends the output quietly; any other write error is reported.
+fn emit(text: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result.context("write to stdout"),
+    }
+}
+
+/// Which report a request's reply is rendered as.
+enum View {
+    Status,
+    Flows,
+    Action,
+}
+
+impl View {
+    fn of(request: &Request) -> Self {
+        match request {
+            Request::Status => Self::Status,
+            Request::Flows => Self::Flows,
+            _ => Self::Action,
+        }
+    }
+
+    fn render(&self, theme: &Theme, response: &Response) -> String {
+        match self {
+            Self::Status => view::status(theme, response),
+            Self::Flows => view::flows(theme, response),
+            Self::Action => view::action(theme, response),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skyline_common::{
+        CapabilityReport, GuardStatus, RackRtoStatus, RackTuningConfig, RackTuningStatus,
+        RedundancyStatus, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineMetrics,
+    };
+
+    #[test]
+    fn version_flag_is_recognised() {
+        let error = Arguments::try_parse_from(["ssctl", "--version"])
+            .expect_err("--version exits through clap");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    /// A new ssctl talking to a daemon from before `version`/`guard` existed
+    /// (an upgrade in progress, a daemon not restarted yet) must still decode
+    /// the reply instead of failing on the missing fields.
+    #[test]
+    fn decodes_a_status_from_a_daemon_older_than_the_guard() {
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let status = RuntimeStatus {
+            version: "0.3.0".to_owned(),
+            enabled: true,
+            generation: 2,
+            modules: shipped.enabled_modules.clone(),
+            fallback_cc: shipped.fallback_cc.clone(),
+            active_flows: 0,
+            tc_stats: None,
+            metrics: Some(SkylineMetrics {
+                ack_events: 326_763,
+                guardrail_hits: 193_027,
+                ..SkylineMetrics::default()
+            }),
+            metrics_recent: None,
+            rack_tuning: RackTuningStatus {
+                managed: RackTuningConfig::default(),
+                live: RackTuningConfig::default(),
+            },
+            rack_rto: RackRtoStatus {
+                config: shipped.rack_rto,
+                stats: None,
+            },
+            retransmit_dscp: RetransmitDscpStatus {
+                config: shipped.retransmit_dscp,
+                stats: None,
+            },
+            redundancy: RedundancyStatus {
+                config: shipped.redundancy,
+                active: true,
+                stats: None,
+            },
+            module_tuning: ModuleTuningConfig::from_config(&shipped),
+            capabilities: CapabilityReport {
+                kernel_release: "6.12.0".to_owned(),
+                btf: true,
+                bpffs: true,
+                cgroup_v2: true,
+                fq_available: true,
+                struct_ops: true,
+                rack_reo_hook: false,
+                fallback_cc_available: true,
+                notes: Vec::new(),
+            },
+            guard: GuardStatus {
+                armed: true,
+                ..GuardStatus::default()
+            },
+            uptime_s: 1234,
+            attached_s: Some(60),
+        };
+        let response = Response {
+            ok: true,
+            message: "status returned".to_owned(),
+            status: Some(status),
+            flows: None,
+        };
+        let mut wire = serde_json::to_value(&response).expect("encode");
+        assert!(wire
+            .as_object_mut()
+            .expect("response object")
+            .remove("flows")
+            .is_some());
+        let fields = wire["status"].as_object_mut().expect("status object");
+        assert!(fields.remove("version").is_some());
+        assert!(fields.remove("guard").is_some());
+        assert!(fields.remove("uptime_s").is_some());
+        assert!(fields.remove("attached_s").is_some());
+        assert!(fields.remove("redundancy").is_some());
+        assert!(fields.remove("metrics_recent").is_some());
+        // The two counters 0.5.0 added to the metrics.
+        let metrics = fields["metrics"].as_object_mut().expect("metrics object");
+        assert!(metrics.remove("guardrail_rounds").is_some());
+        assert!(metrics.remove("cwnd_cap_hits").is_some());
+
+        let decoded: Response = serde_json::from_value(wire).expect("decode an older reply");
+        assert!(decoded.flows.is_none());
+        let decoded = decoded.status.expect("status");
+        assert_eq!(decoded.version, "");
+        assert_eq!(decoded.guard, GuardStatus::default());
+        assert_eq!(decoded.uptime_s, 0);
+        assert_eq!(decoded.attached_s, None);
+        // A daemon from before first-flight redundancy is not copying anything.
+        assert!(!decoded.redundancy.active);
+        assert!(decoded.enabled);
+        assert_eq!(decoded.metrics_recent, None);
+        let metrics = decoded.metrics.expect("metrics");
+        assert_eq!(metrics.guardrail_hits, 193_027);
+        assert_eq!((metrics.guardrail_rounds, metrics.cwnd_cap_hits), (0, 0));
+    }
+
+    /// Same absolute-replace trap as `set-module-config`: a bare
+    /// `set-redundancy` must reproduce the shipped `[redundancy]`, not some
+    /// other built-in default.
+    #[test]
+    fn set_redundancy_defaults_match_the_shipped_config() {
+        let arguments = Arguments::parse_from(["ssctl", "set-redundancy"]);
+        let Request::SetRedundancy { config: from_cli } = request(arguments.command) else {
+            panic!("set-redundancy did not build a SetRedundancy request");
+        };
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert_eq!(from_cli, shipped.redundancy);
+
+        let arguments = Arguments::parse_from(["ssctl", "set-redundancy", "--disable"]);
+        let Request::SetRedundancy { config } = request(arguments.command) else {
+            panic!("set-redundancy --disable did not build a SetRedundancy request");
+        };
+        assert!(!config.enabled);
+    }
+
+    /// The same trap for `set-rack-rto`: a bare one must send the installed
+    /// template's `[rack_rto]` values, switched on. The template is
+    /// config/speeder-guest.toml -- both install paths put it at
+    /// /etc/skyline-speeder/speeder.toml -- and it leaves the table out, so
+    /// those are the built-in defaults. config/speeder.toml, the file a source
+    /// checkout runs with, carries field-tuned [rack_rto] values instead,
+    /// which `reset-rack-rto` restores there.
+    #[test]
+    fn set_rack_rto_defaults_match_the_installed_config() {
+        let installed =
+            SkylineConfig::load("../../config/speeder-guest.toml").expect("load config");
+
+        let arguments = Arguments::parse_from(["ssctl", "set-rack-rto"]);
+        let Request::SetRackRto { config: from_cli } = request(arguments.command) else {
+            panic!("set-rack-rto did not build a SetRackRto request");
+        };
+        assert_eq!(
+            from_cli,
+            RackRtoConfig {
+                enabled: true,
+                ..installed.rack_rto
+            }
+        );
+
+        let arguments = Arguments::parse_from(["ssctl", "set-rack-rto", "--disable"]);
+        let Request::SetRackRto { config } = request(arguments.command) else {
+            panic!("set-rack-rto --disable did not build a SetRackRto request");
+        };
+        assert_eq!(config, installed.rack_rto);
+    }
+
+    /// `set-module-config` is absolute-replace: a flag left off the command
+    /// line is sent as its built-in default, not left alone. If those
+    /// defaults drift from the shipped configuration file, "change one knob"
+    /// silently rewrites every other knob to a stale value.
+    #[test]
+    fn set_module_config_defaults_match_the_shipped_config() {
+        let arguments = Arguments::parse_from(["ssctl", "set-module-config"]);
+        let Request::SetModuleConfig { config: from_cli } = request(arguments.command) else {
+            panic!("set-module-config did not build a SetModuleConfig request");
+        };
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert_eq!(from_cli, ModuleTuningConfig::from_config(&shipped));
     }
 }

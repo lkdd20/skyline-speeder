@@ -68,6 +68,8 @@ RUN_FIELDS = [
     "metrics_guardrail_hits",
     "metrics_hypothetical_early_loss",
     "metrics_prr_adjustments",
+    "metrics_guardrail_rounds",
+    "metrics_cwnd_cap_hits",
     "n_segments",
     "segment_goodput_json",
     "retransmit_dscp_enabled",
@@ -88,7 +90,7 @@ RUN_FIELDS = [
     "error",
 ]
 
-# Fields of ssctl status's "metrics" object (mirrors struct skyline_metrics in
+# Fields of ssctl status --json's "metrics" object (mirrors struct skyline_metrics in
 # bpf/include/skyline_abi.h) that are worth surfacing as before/after deltas.
 # "ack_events" and "delivered_packets" are omitted from RUN_FIELDS (pure
 # volume counters, not diagnostic of "did this feature ever fire") but are
@@ -106,6 +108,11 @@ METRICS_DELTA_FIELDS = (
     "guardrail_hits",
     "hypothetical_early_loss",
     "prr_adjustments",
+    # Since 0.5.0: guardrail_hits counts guardrail trips per round only, out
+    # of guardrail_rounds; the per-ACK cwnd-cap count it used to include is
+    # cwnd_cap_hits. Runs recorded before that have neither field and read 0.
+    "guardrail_rounds",
+    "cwnd_cap_hits",
 )
 
 
@@ -241,7 +248,7 @@ def parse_ss_samples(path):
 
 
 def skyline_metrics_delta(run_dir):
-    """Before/after delta of ssctl status's `metrics` field (struct
+    """Before/after delta of ssctl status --json's `metrics` field (struct
     skyline_metrics), the percpu counters that were populated from day one but
     never read by the Rust side until the feature-coverage debug pass. Used
     to directly confirm whether a given case actually exercised a specific
@@ -268,7 +275,7 @@ def skyline_metrics_delta(run_dir):
     }
 
 
-#: Fields of ssctl status's `rack_rto.stats` object (mirrors struct
+#: Fields of ssctl status --json's `rack_rto.stats` object (mirrors struct
 #: skyline_rto_stats in bpf/include/skyline_abi.h) surfaced as before/after deltas.
 #: The rto_max_* fields (since v2 of struct skyline_rto_tuning, the TCP_RTO_MAX_MS
 #: ceiling feature) are diagnostic-only, same role as applied/rejected below
@@ -284,7 +291,7 @@ RACK_RTO_STATS_DELTA_FIELDS = (
 
 
 def rack_rto_stats_delta(run_dir):
-    """M1 tier-2 diagnostic: before/after delta of ssctl status's
+    """M1 tier-2 diagnostic: before/after delta of ssctl status --json's
     `rack_rto.stats` field."""
 
     def stats_of(path):
@@ -306,18 +313,19 @@ def rack_rto_stats_delta(run_dir):
     }
 
 
-#: Fields of ssctl status's `retransmit_dscp.stats` object (mirrors struct
+#: Fields of ssctl status --json's `retransmit_dscp.stats` object (mirrors struct
 #: skyline_retransmit_dscp_stats in bpf/include/skyline_abi.h). In-kernel truth, zero
 #: parsing, always available even when case.scenario.capture_retransmits is
 #: off -- the right oracle for gating checks (enabled/disabled,
 #: abi_mismatch). NOT the right oracle for absolute counts against the
 #: capture-derived columns below: retransmits_marked counts skbs, one per TC
 #: pass, while the capture counts wire packets -- these diverge at high
-#: throughput because skb->gso_segs>1 shows up even with offload=off fully
-#: confirmed (tso/gso/gro all off, MTU-sized wire packets, reproduced on an
-#: isolated connection -- see retransmit-dscp-mechanism.toml's header
-#: comment). retransmit_capture_marked/false_positives, not this field, is
-#: the authority on marking correctness.
+#: throughput because the TC hook sees TCP's GSO batches even with offload=off
+#: (sk_setup_caps() gives every TCP socket NETIF_F_GSO; the batch is split in
+#: software only on its way from the qdisc to the NIC -- see
+#: retransmit-dscp-mechanism.toml's header comment).
+#: retransmit_capture_marked/false_positives, not this field, is the authority
+#: on marking correctness.
 RETRANSMIT_DSCP_STATS_DELTA_FIELDS = (
     "packets_seen",
     "retransmits_detected",
@@ -330,7 +338,7 @@ RETRANSMIT_DSCP_STATS_DELTA_FIELDS = (
 
 
 def retransmit_dscp_stats_delta(run_dir):
-    """Retransmit-DSCP diagnostic: before/after delta of ssctl status's
+    """Retransmit-DSCP diagnostic: before/after delta of ssctl status --json's
     `retransmit_dscp.stats` field."""
 
     def stats_of(path):
@@ -584,6 +592,8 @@ def load_run(run_dir):
         "metrics_guardrail_hits": "",
         "metrics_hypothetical_early_loss": "",
         "metrics_prr_adjustments": "",
+        "metrics_guardrail_rounds": "",
+        "metrics_cwnd_cap_hits": "",
         "n_segments": len(scenario.get("segments") or []),
         "segment_goodput_json": "",
         "retransmit_dscp_enabled": bool(
@@ -652,6 +662,8 @@ def load_run(run_dir):
     row["metrics_guardrail_hits"] = metrics_delta["guardrail_hits"]
     row["metrics_hypothetical_early_loss"] = metrics_delta["hypothetical_early_loss"]
     row["metrics_prr_adjustments"] = metrics_delta["prr_adjustments"]
+    row["metrics_guardrail_rounds"] = metrics_delta["guardrail_rounds"]
+    row["metrics_cwnd_cap_hits"] = metrics_delta["cwnd_cap_hits"]
     if row["rack_rto_enabled"] and rack_rto_applied == 0:
         # M1 tier-2 was declared on for this case but never actually fired --
         # cgroup membership, RTT_CB subscription, or the setsockopt path are

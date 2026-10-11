@@ -9,13 +9,26 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
-/// ABI version for `KernelConfig`, matched against `bpf/include/skyline_abi.h`'s
-/// `SKYLINE_ABI_VERSION`. `skyline_config_get_slot()` on the BPF side rejects a
-/// version mismatch rather than misinterpreting the struct layout. See
+/// ABI version for `KernelConfig` and `SkylineMetrics`, matched against
+/// `bpf/include/skyline_abi.h`'s `SKYLINE_ABI_VERSION`. `skyline_adopt_config()`
+/// on the BPF side adopts nothing on a version mismatch rather than
+/// misinterpreting the struct layout, and skyline_cc then leaves every
+/// connection alone without reporting anything. See
 /// `bpf/include/skyline_abi.h`'s top-of-file comment for what the current
 /// layout encodes (target deployment envelope, M2/M3 semantics, the
 /// queue-delay/ECN guardrail's `guardrail_gain_permille`).
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 8;
+
+/// The congestion control algorithm name skyline_cc registers under. Must stay
+/// byte-identical to `.name` in bpf/skyline_cc.bpf.c -- the kernel matches the
+/// sysctl write in `skyline-speederd` against the registered name, and a mismatch
+/// fails with EINVAL rather than silently doing nothing. `ssctl` compares the
+/// live `tcp_congestion_control` against it to tell "attached" from "actually
+/// carrying the host's traffic". Deliberately NOT reused for struct_ops *map*
+/// name lookups: those happen to be the same string today but are a different
+/// namespace, and collapsing them would couple two things that are free to
+/// diverge.
+pub const SKYLINE_CC_NAME: &str = "skyline_cc";
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +152,14 @@ pub struct RuntimeConfig {
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
     pub events_path: PathBuf,
+    /// Size, in MiB, at which `events_path` is renamed to `<events_path>.1`
+    /// (replacing the previous one) and started afresh, so the event log never
+    /// holds much more than twice this. `events_path` sits on /run, a RAM-backed
+    /// tmpfs shared with everything else on the host; an unbounded log once
+    /// filled it and took Docker down with it. Defaulted so a config written
+    /// before the cap existed is bounded too. 0 turns the event log off.
+    #[serde(default = "default_events_max_mib")]
+    pub events_max_mib: u32,
     #[serde(default)]
     pub tc_interface: Option<String>,
 }
@@ -292,6 +313,125 @@ impl Default for RetransmitDscpConfig {
     }
 }
 
+/// `[redundancy]`: first-flight redundancy, carried out by
+/// `bpf/skyline_tc.bpf.c` on `runtime.tc_interface` -- see the doc comment on
+/// `struct skyline_redundancy_config` in `bpf/include/skyline_abi.h`. While
+/// skyline_cc is enabled, every SYN-ACK this host sends, every SYN of a
+/// skyline_cc socket and every segment that starts within the first
+/// `first_kib` KiB a skyline_cc connection sends goes out twice, the copy
+/// `delay_ms` after the original.
+///
+/// On by default -- also for an installed configuration without the table,
+/// which is never overwritten on upgrade: a short response on a lossy path
+/// spends most of its life waiting for loss recovery (TLP, RTO, the fixed
+/// one-second SYN-ACK timeout), and a late second copy removes most of that
+/// wait for the price of sending the first `first_kib` KiB twice.
+/// `delay_ms = 0` sends the copy right behind the original, which two
+/// back-to-back packets survive together less often than two a few
+/// milliseconds apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RedundancyConfig {
+    pub enabled: bool,
+    /// Segments that start within this many KiB of what the connection has
+    /// sent are copied. 1..=1024 while `enabled`.
+    pub first_kib: u32,
+    /// How long after the original the copy leaves, held by the fq qdisc.
+    /// 0..=100.
+    pub delay_ms: u32,
+}
+
+impl RedundancyConfig {
+    pub const MAX_FIRST_KIB: u32 = 1024;
+    pub const MAX_DELAY_MS: u32 = 100;
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// `active` is whether skyline_cc is enabled right now: the program only
+    /// copies while that and `enabled` both hold, so the SYN-ACKs of a host
+    /// that drained back to `fallback_cc` go out once.
+    pub fn kernel_config(&self, active: bool) -> KernelRedundancyConfig {
+        KernelRedundancyConfig {
+            abi_version: SKYLINE_REDUNDANCY_ABI_VERSION,
+            enabled: u32::from(self.enabled && active),
+            bytes: self.first_kib.saturating_mul(1024),
+            delay_us: self.delay_ms.saturating_mul(1000),
+        }
+    }
+}
+
+impl Default for RedundancyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            first_kib: 64,
+            delay_ms: 10,
+        }
+    }
+}
+
+/// `[guard]`: what skyline-speederd keeps in place while skyline_cc is enabled
+/// (between a successful `Request::Enable` and the next `Request::Drain`).
+///
+/// Ownership, which is an invariant -- each of these has exactly one writer so
+/// two places cannot drift apart:
+/// - `net.ipv4.tcp_congestion_control` = `skyline_cc` (always; skyline-speederd
+///   already owned this sysctl before the guard existed);
+/// - `net.core.default_qdisc` = `fq` and the root qdisc of
+///   `runtime.tc_interface` = `fq` (or `mq` whose every child is `fq` on a
+///   multi-queue device), only while `qdisc = true`. When `tc_interface` is a
+///   VLAN, bond or bridge (root `noqueue`, the kernel default there) that
+///   means the NICs under it instead; a shaped cake and classful/shaping
+///   qdiscs are left alone. `infra/boot-enable.sh` used to write the qdisc
+///   sysctl once at boot; it no longer does.
+///
+/// Why a periodic re-check and not a one-shot write: "one-click BBR" scripts
+/// persist `tcp_congestion_control=bbr` and `default_qdisc=cake|fq_pie` in
+/// /etc/sysctl.d, and anything that re-runs `sysctl --system` flips the host
+/// back silently -- every new connection then bypasses skyline_cc and nothing
+/// reports it. And `default_qdisc` only affects qdiscs created afterwards, so a
+/// NIC brought up before that sysctl ran keeps whatever it got (fq_codel on a
+/// stock Debian host), which is why the interface's root qdisc is replaced too.
+///
+/// Independent of `KernelConfig`/`ABI_VERSION`: nothing here reaches BPF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardConfig {
+    /// Seconds between re-checks while skyline_cc is enabled. 0 turns the
+    /// periodic re-check off; `ssctl enable` still applies everything once.
+    #[serde(default = "default_guard_interval_s")]
+    pub interval_s: u32,
+    /// `false` leaves every qdisc alone: skyline-speederd then owns only the
+    /// congestion control.
+    #[serde(default = "default_true")]
+    pub qdisc: bool,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            interval_s: DEFAULT_GUARD_INTERVAL_S,
+            qdisc: true,
+        }
+    }
+}
+
+/// See `GuardConfig::interval_s`.
+pub const DEFAULT_GUARD_INTERVAL_S: u32 = 5;
+
+/// Upper bound on `GuardConfig::interval_s`. A re-check an hour apart is
+/// already too slow to be worth calling a guard; anything beyond that is far
+/// more likely a typo (milliseconds for seconds) than intent.
+pub const MAX_GUARD_INTERVAL_S: u32 = 3600;
+
+fn default_guard_interval_s() -> u32 {
+    DEFAULT_GUARD_INTERVAL_S
+}
+
 /// Live-tunable mirror of every M2 (`[adaptive_cwnd]`)/M3 (`[loss_classifier]`)
 /// coefficient plus the top-level safety limits (`max_pacing_mbps`/
 /// `max_cwnd_packets`/`max_queue_delay_ms`/`initial_cwnd_packets`). This
@@ -308,6 +448,11 @@ pub struct ModuleTuningConfig {
     pub max_queue_delay_ratio: f64,
     /// See `SkylineConfig::initial_cwnd_packets`.
     pub initial_cwnd_packets: u32,
+    /// See `SkylineConfig::min_cwnd_packets`. Defaulted on the wire so a
+    /// request that predates the field still means "today's behavior"
+    /// rather than failing to parse.
+    #[serde(default = "default_min_cwnd_packets")]
+    pub min_cwnd_packets: u32,
     pub min_rtt_window_s: u32,
     pub bw_window_rtts: u32,
     pub startup_plateau_rtts: u32,
@@ -337,6 +482,7 @@ impl ModuleTuningConfig {
             max_queue_delay_ms: config.max_queue_delay_ms,
             max_queue_delay_ratio: config.max_queue_delay_ratio,
             initial_cwnd_packets: config.initial_cwnd_packets,
+            min_cwnd_packets: config.min_cwnd_packets,
             min_rtt_window_s: config.adaptive_cwnd.min_rtt_window_s,
             bw_window_rtts: config.adaptive_cwnd.bw_window_rtts,
             startup_plateau_rtts: config.adaptive_cwnd.startup_plateau_rtts,
@@ -361,6 +507,7 @@ impl ModuleTuningConfig {
         config.max_queue_delay_ms = self.max_queue_delay_ms;
         config.max_queue_delay_ratio = self.max_queue_delay_ratio;
         config.initial_cwnd_packets = self.initial_cwnd_packets;
+        config.min_cwnd_packets = self.min_cwnd_packets;
         config.adaptive_cwnd.min_rtt_window_s = self.min_rtt_window_s;
         config.adaptive_cwnd.bw_window_rtts = self.bw_window_rtts;
         config.adaptive_cwnd.startup_plateau_rtts = self.startup_plateau_rtts;
@@ -411,6 +558,18 @@ pub struct SkylineConfig {
     /// whatever the kernel already set (today's behavior).
     #[serde(default)]
     pub initial_cwnd_packets: u32,
+    /// Floor under M2's BDP-derived cwnd target (see
+    /// `bpf/include/skyline_abi.h`'s `min_cwnd_packets` doc comment). A thin
+    /// or app-limited flow's `bw_bps * base_rtt` comes out below a handful
+    /// of packets, and a window that small can only recover from a loss via
+    /// a tail-loss probe or an RTO. It is also where a short response
+    /// restarts after an RTO, since such a flow usually never gets a
+    /// bandwidth estimate. Pacing still sets the send rate, so this does not
+    /// make a flow send faster. Omitted = 4, the floor this project always
+    /// had (the shipped templates set 32); only consulted while M2
+    /// (`adaptive-cwnd`) is on.
+    #[serde(default = "default_min_cwnd_packets")]
+    pub min_cwnd_packets: u32,
     pub adaptive_cwnd: AdaptiveCwndConfig,
     pub loss_classifier: LossClassifierConfig,
     #[serde(default)]
@@ -419,6 +578,14 @@ pub struct SkylineConfig {
     pub rack_rto: RackRtoConfig,
     #[serde(default)]
     pub retransmit_dscp: RetransmitDscpConfig,
+    /// Defaulted -- to on -- so an installed configuration from before the
+    /// table gets it too; see `RedundancyConfig`.
+    #[serde(default)]
+    pub redundancy: RedundancyConfig,
+    /// Defaulted so an installed 0.2.0 configuration (never overwritten on
+    /// upgrade, and without the table) still gets the guard.
+    #[serde(default)]
+    pub guard: GuardConfig,
     pub runtime: RuntimeConfig,
 }
 
@@ -427,9 +594,41 @@ impl SkylineConfig {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .map_err(|source| ConfigError::Read(path.to_path_buf(), source))?;
-        let config: Self = toml::from_str(&content).map_err(ConfigError::Parse)?;
+        let config = Self::from_toml(&content)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// A configuration file's text, parsed, refusing any key the
+    /// configuration does not have.
+    ///
+    /// serde passes over an unknown key without a word, and a key in the
+    /// wrong table is unknown there: `guardrail_gain` written above
+    /// `[adaptive_cwnd]` instead of under it passed `--validate-only`, and the
+    /// daemon ran on the value the operator meant to replace. So the file is
+    /// read as a plain table first, and every key in it has to come back when
+    /// the parsed configuration is written out again. `deny_unknown_fields`
+    /// would refuse such keys too, but not only in the file: most of these
+    /// types also travel in requests and status replies, where a field from
+    /// a newer peer must go on decoding. Nothing is validated here; `load`
+    /// does that next.
+    pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
+        let file: toml::Table = toml::from_str(content).map_err(ConfigError::Parse)?;
+        let config: Self = toml::Value::Table(file.clone())
+            .try_into()
+            .map_err(ConfigError::Parse)?;
+        let Ok(toml::Value::Table(known)) = toml::Value::try_from(&config) else {
+            return Err(ConfigError::Invalid(
+                "the configuration could not be written back out to check it for unknown keys",
+            ));
+        };
+        let mut unknown = Vec::new();
+        unknown_keys(&file, &known, &known, "", &mut unknown);
+        if unknown.is_empty() {
+            Ok(config)
+        } else {
+            Err(ConfigError::UnknownKeys(unknown.join("; ")))
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -444,6 +643,18 @@ impl SkylineConfig {
         if self.max_cwnd_packets < 4 {
             return Err(ConfigError::Invalid("max_cwnd_packets must be at least 4"));
         }
+        // The BPF side takes max(min_cwnd_packets, SKYLINE_MIN_CWND), so a
+        // smaller value would be silently ignored -- reject it here instead.
+        if self.min_cwnd_packets < MIN_CWND_FLOOR {
+            return Err(ConfigError::Invalid("min_cwnd_packets must be at least 4"));
+        }
+        // skyline_set_cwnd_target() applies the cap first and the floor last;
+        // a floor above the cap would undo the cap on every ACK.
+        if self.min_cwnd_packets > self.max_cwnd_packets {
+            return Err(ConfigError::Invalid(
+                "min_cwnd_packets must not exceed max_cwnd_packets",
+            ));
+        }
         if !(1..=10).contains(&self.adaptive_cwnd.bw_window_rtts) {
             return Err(ConfigError::Invalid(
                 "bw_window_rtts must be between 1 and 10",
@@ -457,6 +668,7 @@ impl SkylineConfig {
         if !(0.0..=1.0).contains(&self.adaptive_cwnd.startup_growth_ratio) {
             return Err(ConfigError::Ratio(
                 "startup_growth_ratio",
+                1.0,
                 self.adaptive_cwnd.startup_growth_ratio,
             ));
         }
@@ -466,6 +678,7 @@ impl SkylineConfig {
         if !(0.0..=0.5).contains(&self.loss_classifier.loss_inflation_max_ratio) {
             return Err(ConfigError::Ratio(
                 "loss_inflation_max_ratio",
+                0.5,
                 self.loss_classifier.loss_inflation_max_ratio,
             ));
         }
@@ -485,6 +698,7 @@ impl SkylineConfig {
         if !(0.0..=1.0).contains(&self.adaptive_cwnd.guardrail_gain) {
             return Err(ConfigError::Ratio(
                 "guardrail_gain",
+                1.0,
                 self.adaptive_cwnd.guardrail_gain,
             ));
         }
@@ -557,6 +771,29 @@ impl SkylineConfig {
                 u32::from(self.retransmit_dscp.dscp_value),
             ));
         }
+        if self.redundancy.enabled
+            && !(1..=RedundancyConfig::MAX_FIRST_KIB).contains(&self.redundancy.first_kib)
+        {
+            return Err(ConfigError::Range(
+                "redundancy.first_kib",
+                "1..=1024 while redundancy is enabled",
+                self.redundancy.first_kib,
+            ));
+        }
+        if self.redundancy.delay_ms > RedundancyConfig::MAX_DELAY_MS {
+            return Err(ConfigError::Range(
+                "redundancy.delay_ms",
+                "0..=100",
+                self.redundancy.delay_ms,
+            ));
+        }
+        if self.guard.interval_s > MAX_GUARD_INTERVAL_S {
+            return Err(ConfigError::Range(
+                "guard.interval_s",
+                "0..=3600 (0 = no periodic re-check)",
+                self.guard.interval_s,
+            ));
+        }
         Ok(())
     }
 
@@ -596,6 +833,8 @@ impl SkylineConfig {
             cruise_pacing_permille: permille(self.adaptive_cwnd.cruise_pacing_gain),
             loss_inflation_max_permille: permille(self.loss_classifier.loss_inflation_max_ratio),
             guardrail_gain_permille: permille(self.adaptive_cwnd.guardrail_gain),
+            min_cwnd_packets: self.min_cwnd_packets,
+            reserved: 0,
         }
     }
 }
@@ -604,8 +843,82 @@ fn permille(value: f64) -> u32 {
     (value * 1000.0).round().clamp(0.0, u32::MAX as f64) as u32
 }
 
+/// Appends to `out` each key of `file` that `known` -- the same table of the
+/// parsed configuration written back out -- lacks, saying where it was and,
+/// when the name is a key of some other table, which one. `prefix` is the
+/// dotted name of the table being walked, "" at the top level; `root` is the
+/// whole configuration written back out.
+fn unknown_keys(
+    file: &toml::Table,
+    known: &toml::Table,
+    root: &toml::Table,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    for (key, value) in file {
+        match known.get(key) {
+            Some(toml::Value::Table(known_table)) => {
+                if let toml::Value::Table(file_table) = value {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    unknown_keys(file_table, known_table, root, &path, out);
+                }
+            }
+            Some(_) => {}
+            None if value.is_table() => out.push(if prefix.is_empty() {
+                format!("table [{key}]")
+            } else {
+                format!("table [{prefix}.{key}]")
+            }),
+            None => {
+                let place = if prefix.is_empty() {
+                    format!("{key} at the top level")
+                } else {
+                    format!("{key} in [{prefix}]")
+                };
+                out.push(match home_of(root, key, prefix) {
+                    Some(home) => format!("{place} (it is {home})"),
+                    None => place,
+                });
+            }
+        }
+    }
+}
+
+/// Where `key` is a key of the configuration, other than in the table named
+/// `not_in` ("" for the top level).
+fn home_of(root: &toml::Table, key: &str, not_in: &str) -> Option<String> {
+    if !not_in.is_empty() && root.get(key).is_some_and(|value| !value.is_table()) {
+        return Some("a top-level key, written above the first [table]".to_owned());
+    }
+    root.iter().find_map(|(name, value)| match value {
+        toml::Value::Table(table) if name != not_in && table.contains_key(key) => {
+            Some(format!("a key of [{name}]"))
+        }
+        _ => None,
+    })
+}
+
 fn default_true() -> bool {
     true
+}
+
+/// `SKYLINE_MIN_CWND` in `bpf/skyline_cc.bpf.c` -- the fixed floor the M2-off
+/// path keeps, and the lowest value `min_cwnd_packets` may take.
+pub const MIN_CWND_FLOOR: u32 = 4;
+
+fn default_min_cwnd_packets() -> u32 {
+    MIN_CWND_FLOOR
+}
+
+/// See `RuntimeConfig::events_max_mib`.
+pub const DEFAULT_EVENTS_MAX_MIB: u32 = 8;
+
+fn default_events_max_mib() -> u32 {
+    DEFAULT_EVENTS_MAX_MIB
 }
 
 #[repr(C)]
@@ -638,6 +951,12 @@ pub struct KernelConfig {
     /// count are unchanged, see `bpf/include/skyline_abi.h`'s top-of-file
     /// comment.
     pub guardrail_gain_permille: u32,
+    /// See `SkylineConfig::min_cwnd_packets`.
+    pub min_cwnd_packets: u32,
+    /// Explicit tail padding -- the `u64` above makes the struct 8-byte
+    /// aligned and `Pod` rejects implicit padding. Always 0; mirrors
+    /// `struct skyline_config`'s `reserved`.
+    pub reserved: u32,
 }
 
 /// Mirrors `struct skyline_rto_tuning` (`bpf/include/skyline_abi.h`). Independent of
@@ -697,6 +1016,36 @@ pub struct RetransmitDscpStats {
     pub ipv6_chain_bailout: u64,
 }
 
+/// Mirrors `struct skyline_redundancy_config` (`bpf/include/skyline_abi.h`).
+/// Independent of `KernelConfig`/`ABI_VERSION`, same as the retransmit-DSCP
+/// slot -- see `RedundancyConfig`.
+pub const SKYLINE_REDUNDANCY_ABI_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct KernelRedundancyConfig {
+    pub abi_version: u32,
+    pub enabled: u32,
+    pub bytes: u32,
+    pub delay_us: u32,
+}
+
+/// Mirrors `struct skyline_redundancy_stats` (`bpf/include/skyline_abi.h`),
+/// summed over CPUs. Field order must match the C struct exactly.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+pub struct RedundancyStats {
+    /// Copies sent (a GSO super-packet counts once).
+    pub packets: u64,
+    /// `skb->len` of those copies: all payload, but a GSO super-packet's
+    /// headers only once, so slightly under the bytes on the wire.
+    pub bytes: u64,
+    /// Subset of `packets`: SYN-ACKs and SYNs.
+    pub handshakes: u64,
+    pub clone_failed: u64,
+    pub abi_mismatch: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SkylineEvent {
@@ -744,21 +1093,77 @@ pub struct RackRtoStats {
 }
 
 /// Mirrors `struct skyline_metrics` (`bpf/include/skyline_abi.h`) -- percpu counters
-/// updated by `skyline_cc.bpf.c` on every ack/loss/pacing/transition decision.
+/// updated by `skyline_cc.bpf.c` on every ack/loss/pacing/transition decision,
+/// summed over CPUs. Every field is a `u64` counter, which `accumulate` and
+/// `since` rely on. Defaulted field by field on the wire, so a newer `ssctl`
+/// decodes a reply from a daemon older than a counter (it reads 0).
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SkylineMetrics {
     pub ack_events: u64,
     pub delivered_packets: u64,
     pub loss_events: u64,
     pub state_transitions: u64,
     pub pacing_updates: u64,
+    /// Rounds in which the queue-delay/ECN guardrail tripped: a share of
+    /// `guardrail_rounds`, not of `ack_events`. Up to 0.4.x this also took
+    /// what is `cwnd_cap_hits` now; a daemon that old reports a non-zero
+    /// `guardrail_hits` with `guardrail_rounds` 0.
     pub guardrail_hits: u64,
     pub hypothetical_early_loss: u64,
     /// See `bpf/include/skyline_abi.h`'s doc comment on the field of the same
     /// name -- nonzero here for an M2-on profile means the PRR-bypass
     /// did not take effect.
     pub prr_adjustments: u64,
+    /// Rounds in which the guardrail was checked: every new round of a flow
+    /// with M2 (`adaptive-cwnd`) on.
+    pub guardrail_rounds: u64,
+    /// ACKs after which cwnd sat at `max_cwnd_packets`: a share of
+    /// `ack_events`. The ceiling holding, not a congestion signal.
+    pub cwnd_cap_hits: u64,
+}
+
+const METRIC_COUNTERS: usize = std::mem::size_of::<SkylineMetrics>() / std::mem::size_of::<u64>();
+
+impl SkylineMetrics {
+    fn counters(&self) -> &[u64; METRIC_COUNTERS] {
+        bytemuck::cast_ref(self)
+    }
+
+    fn counters_mut(&mut self) -> &mut [u64; METRIC_COUNTERS] {
+        bytemuck::cast_mut(self)
+    }
+
+    /// Adds `other` counter by counter, saturating: how the daemon sums the
+    /// per-CPU copies of the map.
+    pub fn accumulate(&mut self, other: &Self) {
+        for (total, value) in self.counters_mut().iter_mut().zip(other.counters()) {
+            *total = total.saturating_add(*value);
+        }
+    }
+
+    /// What was counted after `earlier` was read, counter by counter; 0
+    /// where a counter is lower now (a new attach starts them over).
+    pub fn since(&self, earlier: &Self) -> Self {
+        let mut delta = *self;
+        for (now, then) in delta.counters_mut().iter_mut().zip(earlier.counters()) {
+            *now = now.saturating_sub(*then);
+        }
+        delta
+    }
+}
+
+/// What `SkylineMetrics` gained over the last `seconds`, about a minute: the
+/// daemon samples the counters every few seconds while skyline_cc is
+/// attached, and this is the latest reading against the sample closest to a
+/// minute old. It tells "happening now" from "happened at some point since
+/// the attach", which the cumulative counters cannot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsWindow {
+    pub seconds: u64,
+    pub metrics: SkylineMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -796,8 +1201,97 @@ pub struct RetransmitDscpStatus {
     pub stats: Option<RetransmitDscpStats>,
 }
 
+/// `[redundancy]` at run time. Defaulted so a newer ssctl can decode the
+/// reply of a daemon older than the feature (which reports it inactive).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RedundancyStatus {
+    pub config: RedundancyConfig,
+    /// What the TC program is acting on: skyline_cc enabled, `[redundancy]`
+    /// on, and the TC object loaded on `runtime.tc_interface`.
+    pub active: bool,
+    pub stats: Option<RedundancyStats>,
+}
+
+/// `[guard]` at run time (see `GuardConfig`). JSON only, not ABI.
+/// Defaulted field by field so a newer ssctl can decode an older daemon's
+/// reply, and the other way round.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardStatus {
+    /// True between a successful `Enable` and the next `Drain`. Starts false
+    /// at daemon start even when a killed previous instance left skyline_cc
+    /// registered: only an `Enable` in this process arms it.
+    pub armed: bool,
+    /// Echo of `[guard]`.
+    pub interval_s: u32,
+    pub qdisc: bool,
+    /// Periodic re-checks run while armed (the pass `Enable` runs itself is
+    /// not counted here).
+    pub checks: u64,
+    /// Times `tcp_congestion_control` was put back to skyline_cc.
+    pub cc_restored: u64,
+    /// Times `default_qdisc` was put back to fq.
+    pub default_qdisc_restored: u64,
+    /// Times the root qdisc of a managed device (`runtime.tc_interface`, or
+    /// a NIC under it -- see `GuardLive::devices`) was replaced.
+    pub interface_qdisc_replaced: u64,
+    /// Human-readable, e.g. "tcp_congestion_control bbr -> skyline_cc".
+    pub last_correction: Option<String>,
+    pub last_correction_unix_s: Option<u64>,
+    /// Most recent failure (tc missing or stuck, a write refused, a replace
+    /// that failed or did not take). Kept until the next one: it is history,
+    /// `notes` is now.
+    pub last_error: Option<String>,
+    /// Fresh read at status time.
+    pub live: GuardLive,
+    /// What the latest pass found and deliberately did not change, and what
+    /// it could not do -- e.g. "eth0 root qdisc htb looks deliberate; left
+    /// alone", "eth0 root qdisc cake: the last replace failed; retrying in
+    /// 30 s".
+    pub notes: Vec<String>,
+}
+
+/// The values `GuardStatus` is about, read fresh at status time whether or
+/// not the guard is armed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardLive {
+    pub tcp_congestion_control: String,
+    pub default_qdisc: String,
+    /// `runtime.tc_interface`.
+    pub interface: Option<String>,
+    /// Summary of that interface's own root qdisc: "fq", "mq/fq", "cake",
+    /// "mq/cake,fq" (mq followed by its children's distinct kinds, sorted),
+    /// "noqueue" on a VLAN/bond/bridge. `None` when there is no interface or
+    /// `tc` could not be read.
+    pub interface_qdisc: Option<String>,
+    /// The devices whose root qdisc the guard manages, with their live
+    /// summaries: `[tc_interface]` itself, or -- when its root is noqueue --
+    /// the NICs found under it through lower_* links (bond slaves, a VLAN's
+    /// real device, a bridge's physical ports; never a tap or veth). Empty
+    /// with `[guard] qdisc = false`, for a tunnel with no NIC under it, and
+    /// from a daemon older than the field.
+    #[serde(default)]
+    pub devices: Vec<GuardDevice>,
+}
+
+/// One entry of `GuardLive::devices`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardDevice {
+    pub name: String,
+    /// Same format as `GuardLive::interface_qdisc`; `None` when `tc` could
+    /// not read it or it shows no root qdisc (a device that is down).
+    pub qdisc: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    /// The daemon's own version (`CARGO_PKG_VERSION`). Empty when decoded
+    /// from a daemon older than the field.
+    #[serde(default)]
+    pub version: String,
     pub enabled: bool,
     pub generation: u32,
     pub modules: Vec<Module>,
@@ -806,10 +1300,20 @@ pub struct RuntimeStatus {
     pub tc_stats: Option<TcStats>,
     /// `None` when Skyline Speeder CC has never been enabled (mirrors `tc_stats`'s
     /// `Option` -- there is no `skyline_cc.bpf.o` loaded to read the map from).
+    /// Cumulative since the attach (`attached_s`).
     pub metrics: Option<SkylineMetrics>,
+    /// The last minute or so of `metrics`. `None` while nothing is attached,
+    /// in the first few seconds after an attach, and from a daemon older
+    /// than the field.
+    #[serde(default)]
+    pub metrics_recent: Option<MetricsWindow>,
     pub rack_tuning: RackTuningStatus,
     pub rack_rto: RackRtoStatus,
     pub retransmit_dscp: RetransmitDscpStatus,
+    /// Inactive (and `[redundancy]`'s defaults) when decoded from a daemon
+    /// older than the feature.
+    #[serde(default)]
+    pub redundancy: RedundancyStatus,
     /// Live echo of the current M2/M3/M4 coefficients (see
     /// `ModuleTuningConfig`). Unlike `rack_tuning`'s `managed`/`live` split,
     /// a single value suffices here: these fields live entirely in `skyline-speederd`'s
@@ -817,7 +1321,112 @@ pub struct RuntimeStatus {
     /// is no external sysctl-style tampering vector to reconcile against.
     pub module_tuning: ModuleTuningConfig,
     pub capabilities: CapabilityReport,
+    /// `[guard]` state; defaulted (disarmed, zero counters) when decoded from
+    /// a daemon older than the guard.
+    #[serde(default)]
+    pub guard: GuardStatus,
+    /// Seconds since this `skyline-speederd` process started. 0 from a
+    /// daemon older than the field.
+    #[serde(default)]
+    pub uptime_s: u64,
+    /// Seconds since the `Enable` that attached the struct_ops currently
+    /// loaded. `None` while nothing is attached, and from a daemon older
+    /// than the field.
+    #[serde(default)]
+    pub attached_s: Option<u64>,
 }
+
+/// One TCP connection the kernel currently runs on `skyline_cc`, as
+/// `ss -tin` reports it.
+///
+/// Every measurement is the kernel's own (`struct tcp_info` plus what
+/// iproute2 derives from it), not skyline_cc's view of the flow: the BPF
+/// side keeps its per-flow state in an `SK_STORAGE` map, which user space
+/// cannot enumerate without a socket file descriptor. What the two have in
+/// common -- cwnd, pacing rate, RTT -- is exactly the part skyline_cc
+/// writes, so this is a faithful picture of what the acceleration did,
+/// arrived at from the other end.
+///
+/// Every field but `peer`/`local`/`state` is `Option`: iproute2 prints a
+/// key only when the kernel has a value for it, and which keys exist has
+/// changed between versions. A missing one renders as `-` rather than as a
+/// zero that would read like a measurement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlowRow {
+    /// `address:port`, numeric (`ss -n`); IPv6 in brackets.
+    pub peer: String,
+    pub local: String,
+    /// `ESTAB`, `CLOSE-WAIT`, ... as iproute2 spells it.
+    pub state: String,
+    /// Smoothed RTT and its variation, milliseconds (`rtt:13.5/6.2`).
+    pub rtt_ms: Option<f64>,
+    pub rtt_var_ms: Option<f64>,
+    /// `minrtt:` -- the floor skyline_cc's BDP target is built on.
+    pub min_rtt_ms: Option<f64>,
+    /// Congestion window, packets. What M2 drives.
+    pub cwnd_packets: Option<u64>,
+    pub ssthresh: Option<u64>,
+    /// Pacing rate in bits per second. What M2/M4 drive.
+    pub pacing_bps: Option<u64>,
+    /// Kernel's delivery-rate estimate, bits per second.
+    pub delivery_bps: Option<u64>,
+    /// Kernel's send-rate estimate (cwnd/rtt), bits per second.
+    pub send_bps: Option<u64>,
+    pub bytes_sent: Option<u64>,
+    pub bytes_acked: Option<u64>,
+    pub bytes_retrans: Option<u64>,
+    /// Cumulative retransmitted segments (`retrans:0/12`'s second number).
+    pub retrans_total: Option<u64>,
+    pub unacked: Option<u64>,
+    pub mss: Option<u32>,
+    /// Current retransmission timeout, milliseconds. M1 tier-2 moves its
+    /// floor and ceiling, so this is where that shows up.
+    pub rto_ms: Option<f64>,
+}
+
+impl FlowRow {
+    /// Retransmitted share of what was sent, 0.0-1.0, from the byte
+    /// counters. `None` unless both are known and something was sent.
+    pub fn retransmit_ratio(&self) -> Option<f64> {
+        match (self.bytes_sent, self.bytes_retrans) {
+            (Some(sent), Some(retrans)) if sent > 0 => Some(retrans as f64 / sent as f64),
+            _ => None,
+        }
+    }
+}
+
+/// What `ssctl flows` reports: the accelerated connections and how much of
+/// the host's TCP traffic they are.
+///
+/// `accelerated` is capped (see `FLOW_ROWS_MAX`); `on_skyline_cc` is the
+/// full count either way, so a host with thousands of connections still
+/// reports the truth about how many are accelerated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlowReport {
+    /// The accelerated connections, most bytes sent first, capped at
+    /// `FLOW_ROWS_MAX`.
+    pub accelerated: Vec<FlowRow>,
+    /// Connected TCP sockets on the host, whatever congestion control they
+    /// use. Listening sockets are not counted.
+    pub tcp_total: u64,
+    /// How many of those the kernel runs on `skyline_cc`. Can exceed
+    /// `accelerated.len()`, which is capped.
+    pub on_skyline_cc: u64,
+    /// Rows left out of `accelerated` by the cap.
+    pub truncated: u64,
+    /// Why the enumeration is empty or partial: `ss` missing, killed at its
+    /// timeout, or output that could not be parsed. `accelerated` is then
+    /// empty and the counts are 0, but the rest of the report (the
+    /// coefficients in force, the BPF counters) is still valid -- those come
+    /// from the daemon, not from `ss`.
+    pub source_error: Option<String>,
+}
+
+/// How many `FlowRow`s a `FlowReport` carries at most. A terminal cannot
+/// show more, and the counts above stay exact regardless.
+pub const FLOW_ROWS_MAX: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -849,6 +1458,10 @@ pub enum Request {
         config: RetransmitDscpConfig,
     },
     ResetRetransmitDscp,
+    SetRedundancy {
+        config: RedundancyConfig,
+    },
+    ResetRedundancy,
     /// Sent by skyline-speederd's own SIGTERM/SIGINT handler (via a loopback connection
     /// to its own control socket) to unblock the blocking accept loop in
     /// `serve()` -- see that function's doc comment for why a real request
@@ -864,6 +1477,13 @@ pub struct Response {
     pub ok: bool,
     pub message: String,
     pub status: Option<RuntimeStatus>,
+    /// Only `Request::Flows` fills this in: enumerating sockets costs an
+    /// `ss` of its own, which every other request would pay for nothing.
+    /// Defaulted on the wire, so a daemon older than the field still
+    /// decodes here and a newer daemon's reply still decodes in an older
+    /// `ssctl`.
+    #[serde(default)]
+    pub flows: Option<FlowReport>,
 }
 
 #[derive(Debug, Error)]
@@ -874,8 +1494,13 @@ pub enum ConfigError {
     Parse(toml::de::Error),
     #[error("unknown module {0}")]
     UnknownModule(String),
-    #[error("{0} must be between zero and one, got {1}")]
-    Ratio(&'static str, f64),
+    /// The name, the largest value it takes, and the value given.
+    #[error("{0} must be between 0.0 and {1:?}, got {2:?}")]
+    Ratio(&'static str, f64, f64),
+    /// Keys the file has and the configuration does not: see
+    /// `SkylineConfig::from_toml`.
+    #[error("the configuration has keys skyline-speederd does not know and would ignore: {0}")]
+    UnknownKeys(String),
     #[error("{0} must be {1}, got {2}")]
     Range(&'static str, &'static str, u32),
     #[error("{0}")]
@@ -894,7 +1519,7 @@ mod tests {
         // modules -- see config/speeder.toml's enabled_modules comment.
         assert!(config.feature_mask().contains(FeatureMask::EARLY_LOSS));
         // See config/speeder.toml's comment for the default coefficients.
-        assert_eq!(config.kernel_config().cruise_pacing_permille, 1100);
+        assert_eq!(config.kernel_config().cruise_pacing_permille, 1250);
     }
 
     #[test]
@@ -906,6 +1531,125 @@ mod tests {
             PathBuf::from("/opt/skyline-speeder/bpf")
         );
         assert_eq!(config.runtime.tc_interface.as_deref(), Some("data0"));
+    }
+
+    #[test]
+    fn event_log_stays_bounded_when_config_predates_the_cap() {
+        // An installed /etc/skyline-speeder/speeder.toml is never overwritten,
+        // so the hosts that hit the unbounded log will not gain the field on
+        // upgrade -- they must get the cap anyway, not "unlimited".
+        let content =
+            fs::read_to_string("../../config/speeder-guest.toml").expect("read guest config");
+        let legacy: String = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("events_max_mib"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            legacy, content,
+            "guest config should declare events_max_mib"
+        );
+        let config: SkylineConfig = toml::from_str(&legacy).expect("parse legacy config");
+        assert_eq!(config.runtime.events_max_mib, DEFAULT_EVENTS_MAX_MIB);
+
+        for path in [
+            "../../config/speeder.toml",
+            "../../config/speeder-guest.toml",
+        ] {
+            let shipped = SkylineConfig::load(path).expect("load shipped config");
+            assert_eq!(
+                shipped.runtime.events_max_mib, DEFAULT_EVENTS_MAX_MIB,
+                "{path}"
+            );
+        }
+    }
+
+    const SHIPPED_CONFIGS: [&str; 2] = [
+        "../../config/speeder.toml",
+        "../../config/speeder-guest.toml",
+    ];
+
+    #[test]
+    fn guard_defaults_apply_when_config_predates_the_table() {
+        // Same situation as events_max_mib: an installed
+        // /etc/skyline-speeder/speeder.toml from 0.2.0 has no [guard] and is
+        // never overwritten, and it must get the guard anyway.
+        for path in SHIPPED_CONFIGS {
+            let content = fs::read_to_string(path).expect("read config");
+            let mut value: toml::Value = toml::from_str(&content).expect("parse as TOML");
+            value
+                .as_table_mut()
+                .expect("top-level table")
+                .remove("guard")
+                .unwrap_or_else(|| panic!("{path} should declare [guard]"));
+            let legacy: SkylineConfig = value.try_into().expect("parse without [guard]");
+            legacy.validate().expect("still valid");
+            assert_eq!(legacy.guard, GuardConfig::default(), "{path}");
+        }
+    }
+
+    #[test]
+    fn shipped_configs_declare_the_guard_defaults() {
+        assert_eq!(
+            GuardConfig::default(),
+            GuardConfig {
+                interval_s: DEFAULT_GUARD_INTERVAL_S,
+                qdisc: true,
+            }
+        );
+        for path in SHIPPED_CONFIGS {
+            // Declared explicitly, not merely defaulted: the file is where an
+            // operator looks for the knob.
+            let content = fs::read_to_string(path).expect("read config");
+            let value: toml::Value = toml::from_str(&content).expect("parse as TOML");
+            let table = value
+                .get("guard")
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("{path} should declare [guard]"));
+            assert!(table.contains_key("interval_s"), "{path}");
+            assert!(table.contains_key("qdisc"), "{path}");
+
+            let shipped = SkylineConfig::load(path).expect("load shipped config");
+            assert_eq!(shipped.guard, GuardConfig::default(), "{path}");
+        }
+    }
+
+    #[test]
+    fn guard_interval_is_bounded() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.guard.interval_s = MAX_GUARD_INTERVAL_S + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Range("guard.interval_s", _, 3601))
+        ));
+
+        config.guard.interval_s = MAX_GUARD_INTERVAL_S;
+        config.validate().expect("an hour is the upper bound");
+        config.guard.interval_s = 0;
+        config
+            .validate()
+            .expect("0 turns the periodic re-check off");
+    }
+
+    #[test]
+    fn guard_status_decodes_from_a_partial_table() {
+        // A daemon one field behind (or ahead) must not make the whole status
+        // undecodable.
+        let status: GuardStatus =
+            toml::from_str("armed = true\ncc_restored = 2\n").expect("parse partial status");
+        assert!(status.armed);
+        assert_eq!(status.cc_restored, 2);
+        assert_eq!(status.live, GuardLive::default());
+        assert!(status.last_error.is_none());
+
+        // A daemon from before `live.devices`.
+        let live: GuardLive = toml::from_str(
+            "tcp_congestion_control = \"skyline_cc\"\ninterface = \"eth0\"\n\
+             interface_qdisc = \"mq/fq\"\n",
+        )
+        .expect("parse live without devices");
+        assert!(live.devices.is_empty());
+        assert_eq!(live.interface_qdisc.as_deref(), Some("mq/fq"));
     }
 
     #[test]
@@ -1061,7 +1805,7 @@ mod tests {
         let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
         let mut tuning = ModuleTuningConfig::from_config(&config);
         // from_config() must recover exactly what's in config/speeder.toml today.
-        assert_eq!(tuning.cruise_inflight_gain, 2.0);
+        assert_eq!(tuning.cruise_inflight_gain, 3.0);
         assert_eq!(tuning.startup_gain, 3.0);
 
         tuning.loss_inflation_max_ratio = 0.4;
@@ -1138,6 +1882,206 @@ mod tests {
     }
 
     #[test]
+    fn min_cwnd_packets_defaults_to_the_historical_floor_when_omitted() {
+        // Every configuration file written before this field existed must
+        // keep loading, and must keep meaning "4".
+        let content = fs::read_to_string("../../config/speeder.toml").expect("read config");
+        let without: String = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("min_cwnd_packets"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            without.len(),
+            content.len(),
+            "fixture no longer declares the field"
+        );
+        let config: SkylineConfig = toml::from_str(&without).expect("parse without the field");
+        config.validate().expect("still valid");
+        assert_eq!(config.min_cwnd_packets, MIN_CWND_FLOOR);
+        assert_eq!(config.kernel_config().min_cwnd_packets, MIN_CWND_FLOOR);
+    }
+
+    #[test]
+    fn module_tuning_request_without_min_cwnd_packets_still_parses() {
+        // `ModuleTuningConfig` is the `set-module-config` wire payload; a
+        // request that predates the field must mean today's behavior, not
+        // fail to deserialize.
+        let config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let wire = toml::to_string(&ModuleTuningConfig::from_config(&config)).expect("serialize");
+        let without: String = wire
+            .lines()
+            .filter(|line| !line.starts_with("min_cwnd_packets"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let tuning: ModuleTuningConfig = toml::from_str(&without).expect("parse without the field");
+        assert_eq!(tuning.min_cwnd_packets, MIN_CWND_FLOOR);
+    }
+
+    #[test]
+    fn module_tuning_config_kernel_config_carries_min_cwnd_packets() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let mut tuning = ModuleTuningConfig::from_config(&config);
+        tuning.min_cwnd_packets = 16;
+        tuning.apply_to(&mut config);
+        config
+            .validate()
+            .expect("16 is within [4, max_cwnd_packets]");
+        let kernel = config.kernel_config();
+        assert_eq!(kernel.min_cwnd_packets, 16);
+        assert_eq!(kernel.reserved, 0);
+        assert_eq!(
+            ModuleTuningConfig::from_config(&config).min_cwnd_packets,
+            16
+        );
+    }
+
+    #[test]
+    fn min_cwnd_packets_must_stay_between_the_fixed_floor_and_the_cap() {
+        let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+
+        // Below SKYLINE_MIN_CWND the BPF side would silently ignore it.
+        let mut config = base.clone();
+        config.min_cwnd_packets = MIN_CWND_FLOOR - 1;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        // Above the cap the floor would undo the cap on every ACK.
+        let mut config = base.clone();
+        config.min_cwnd_packets = config.max_cwnd_packets + 1;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        let mut config = base;
+        config.min_cwnd_packets = config.max_cwnd_packets;
+        config
+            .validate()
+            .expect("floor == cap is degenerate but consistent");
+    }
+
+    #[test]
+    fn redundancy_is_on_by_default_even_without_the_table() {
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert_eq!(shipped.redundancy, RedundancyConfig::default());
+        assert!(shipped.redundancy.enabled);
+
+        // An installed configuration from before the table is never
+        // overwritten on upgrade; it must come out on, with the defaults.
+        let content = fs::read_to_string("../../config/speeder.toml").expect("read config");
+        let start = content
+            .find("[redundancy]")
+            .expect("shipped config has [redundancy]");
+        let end = content[start + 1..]
+            .find("\n[")
+            .map_or(content.len(), |offset| start + 1 + offset + 1);
+        let without = format!("{}{}", &content[..start], &content[end..]);
+        let config: SkylineConfig = toml::from_str(&without).expect("parse without [redundancy]");
+        assert_eq!(config.redundancy, RedundancyConfig::default());
+    }
+
+    /// speeder-guest.toml is the file every install puts in place (the
+    /// release artifact ships it as config/speeder.toml), so it carries the
+    /// shipped default. The experiment matrix, which must stay comparable
+    /// with docs/04, turns redundancy off per case instead.
+    #[test]
+    fn installed_template_ships_redundancy_on() {
+        let config =
+            SkylineConfig::load("../../config/speeder-guest.toml").expect("load guest config");
+        assert_eq!(config.redundancy, RedundancyConfig::default());
+    }
+
+    #[test]
+    fn redundancy_kernel_config_follows_enable_and_drain() {
+        let config = RedundancyConfig::default();
+        let live = config.kernel_config(true);
+        assert_eq!(live.abi_version, SKYLINE_REDUNDANCY_ABI_VERSION);
+        assert_eq!(live.enabled, 1);
+        assert_eq!(live.bytes, 64 * 1024);
+        assert_eq!(live.delay_us, 10_000);
+        assert_eq!(config.kernel_config(false).enabled, 0);
+        assert_eq!(RedundancyConfig::disabled().kernel_config(true).enabled, 0);
+        assert_eq!(std::mem::size_of::<KernelRedundancyConfig>(), 16);
+        assert_eq!(std::mem::size_of::<RedundancyStats>(), 40);
+    }
+
+    #[test]
+    fn redundancy_rejects_out_of_range_values() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.redundancy.first_kib = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Range("redundancy.first_kib", _, 0))
+        ));
+        config.redundancy.first_kib = RedundancyConfig::MAX_FIRST_KIB + 1;
+        assert!(config.validate().is_err());
+        // Off, the size does not matter.
+        config.redundancy.enabled = false;
+        config
+            .validate()
+            .expect("disabled redundancy ignores first_kib");
+        config.redundancy = RedundancyConfig {
+            delay_ms: RedundancyConfig::MAX_DELAY_MS + 1,
+            ..RedundancyConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Range("redundancy.delay_ms", _, 101))
+        ));
+    }
+
+    #[test]
+    fn kernel_config_has_no_implicit_padding() {
+        // 4 x u32, one u64, 14 x u32 -- `Pod` already refuses to compile with
+        // implicit padding; this pins the size `struct skyline_config` in
+        // bpf/include/skyline_abi.h has to match.
+        assert_eq!(std::mem::size_of::<KernelConfig>(), 80);
+        assert_eq!(std::mem::align_of::<KernelConfig>(), 8);
+    }
+
+    /// Ten u64 counters, in the order of `struct skyline_metrics`: the map
+    /// value is read by layout, and a size that differs makes every per-CPU
+    /// read fail and the counters stay at 0.
+    #[test]
+    fn metrics_mirror_the_c_struct() {
+        assert_eq!(std::mem::size_of::<SkylineMetrics>(), 10 * 8);
+        let mut raw = [0_u64; 10];
+        for (index, value) in raw.iter_mut().enumerate() {
+            *value = index as u64 + 1;
+        }
+        let metrics: SkylineMetrics = bytemuck::cast(raw);
+        assert_eq!(metrics.guardrail_hits, 6);
+        assert_eq!(metrics.prr_adjustments, 8);
+        assert_eq!(metrics.guardrail_rounds, 9);
+        assert_eq!(metrics.cwnd_cap_hits, 10);
+    }
+
+    #[test]
+    fn metrics_add_up_and_difference_counter_by_counter() {
+        let one = SkylineMetrics {
+            ack_events: 10,
+            guardrail_rounds: 4,
+            cwnd_cap_hits: u64::MAX,
+            ..SkylineMetrics::default()
+        };
+        let mut total = one;
+        total.accumulate(&SkylineMetrics {
+            ack_events: 5,
+            guardrail_hits: 1,
+            cwnd_cap_hits: 1,
+            ..SkylineMetrics::default()
+        });
+        assert_eq!(total.ack_events, 15);
+        assert_eq!(total.guardrail_hits, 1);
+        assert_eq!(total.guardrail_rounds, 4);
+        assert_eq!(total.cwnd_cap_hits, u64::MAX, "saturates");
+
+        let delta = total.since(&one);
+        assert_eq!(delta.ack_events, 5);
+        assert_eq!(delta.guardrail_hits, 1);
+        assert_eq!(delta.guardrail_rounds, 0);
+        // A counter lower than before (a new attach) gives 0, not a wrap.
+        assert_eq!(one.since(&total).ack_events, 0);
+    }
+
+    #[test]
     fn module_tuning_rejects_out_of_range_values() {
         let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
 
@@ -1151,15 +2095,109 @@ mod tests {
         let mut tuning = ModuleTuningConfig::from_config(&config);
         tuning.loss_inflation_max_ratio = 0.9;
         tuning.apply_to(&mut config);
+        let error = config.validate().expect_err("0.9 is above the 0.5 ceiling");
         assert!(matches!(
-            config.validate(),
-            Err(ConfigError::Ratio("loss_inflation_max_ratio", _))
+            error,
+            ConfigError::Ratio("loss_inflation_max_ratio", _, _)
         ));
+        // The range the BPF side clamps to, not "zero and one".
+        assert_eq!(
+            error.to_string(),
+            "loss_inflation_max_ratio must be between 0.0 and 0.5, got 0.9"
+        );
+
+        let mut config = base.clone();
+        config.adaptive_cwnd.guardrail_gain = 1.5;
+        assert_eq!(
+            config.validate().expect_err("above 1.0").to_string(),
+            "guardrail_gain must be between 0.0 and 1.0, got 1.5"
+        );
 
         let mut config = base;
         let mut tuning = ModuleTuningConfig::from_config(&config);
         tuning.max_cwnd_packets = 1;
         tuning.apply_to(&mut config);
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    fn shipped_text() -> String {
+        fs::read_to_string("../../config/speeder.toml").expect("read config")
+    }
+
+    #[test]
+    fn shipped_configs_have_no_unknown_keys() {
+        for path in [
+            "../../config/speeder.toml",
+            "../../config/speeder-guest.toml",
+        ] {
+            let text = fs::read_to_string(path).expect("read config");
+            SkylineConfig::from_toml(&text).unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
+    /// The case that went unnoticed: a key above `[adaptive_cwnd]` instead of
+    /// under it parsed, validated, and was never applied.
+    #[test]
+    fn a_key_in_the_wrong_table_is_refused_with_its_table() {
+        let text = shipped_text().replacen(
+            "max_cwnd_packets = 50000",
+            "max_cwnd_packets = 50000\nguardrail_gain = 0.5",
+            1,
+        );
+        let error = SkylineConfig::from_toml(&text).expect_err("misplaced key");
+        assert!(matches!(error, ConfigError::UnknownKeys(_)));
+        assert_eq!(
+            error.to_string(),
+            "the configuration has keys skyline-speederd does not know and would ignore: \
+             guardrail_gain at the top level (it is a key of [adaptive_cwnd])"
+        );
+
+        // And the other way round: a top-level key written inside a table.
+        let text = shipped_text().replacen(
+            "\n[adaptive_cwnd]\n",
+            "\n[adaptive_cwnd]\nmax_cwnd_packets = 9000\n",
+            1,
+        );
+        let error = SkylineConfig::from_toml(&text).expect_err("misplaced key");
+        assert!(error.to_string().ends_with(
+            "max_cwnd_packets in [adaptive_cwnd] (it is a top-level key, written above the \
+             first [table])"
+        ));
+    }
+
+    /// A misspelt table is refused as a whole -- [guard] is optional, so
+    /// without this check the misspelling would only drop it -- and every
+    /// unknown key is listed, not just the first.
+    #[test]
+    fn misspelt_keys_and_tables_are_all_refused() {
+        let text = shipped_text()
+            .replacen("bw_window_rtts = 6", "bw_window_rtts = 6\nbw_window = 6", 1)
+            .replacen("\n[guard]\n", "\n[gaurd]\n", 1);
+        assert_eq!(
+            SkylineConfig::from_toml(&text)
+                .expect_err("misspelt")
+                .to_string(),
+            "the configuration has keys skyline-speederd does not know and would ignore: \
+             bw_window in [adaptive_cwnd]; table [gaurd]"
+        );
+    }
+
+    /// Dotted keys define the same tables as a [table] header does, and an
+    /// optional key that is set must not look unknown.
+    #[test]
+    fn every_way_of_writing_a_known_key_is_accepted() {
+        let block = "[redundancy]\nenabled = true\nfirst_kib = 64   # 1..=1024\n\
+                     delay_ms = 10    # 0..=100\n";
+        let shipped = shipped_text();
+        assert!(shipped.contains(block));
+        let text = shipped.replacen(block, "", 1).replacen(
+            "generation = 1\n",
+            "generation = 1\nredundancy.first_kib = 32\nredundancy.delay_ms = 5\n",
+            1,
+        ) + "\n[rack_tuning]\ntcp_recovery = 1\n";
+        let config = SkylineConfig::from_toml(&text).expect("known keys only");
+        assert_eq!(config.redundancy.first_kib, 32);
+        assert_eq!(config.redundancy.delay_ms, 5);
+        assert_eq!(config.rack_tuning.tcp_recovery, Some(1));
     }
 }

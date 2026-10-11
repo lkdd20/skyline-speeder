@@ -38,13 +38,19 @@
 性能）标记自己的性质，`matrix_lib.py` 的 `validate_manifest()` 会强制校验
 这条约束与 `performance_valid` 字段一致。
 
+场景的 `offload` 决定路由器上的 NetEm 拿到什么：`"off"` 时 Server 数据网卡
+关掉 TSO/GSO/GRO，到达路由器的是一个个的包，`loss_pct`/`reorder_pct` 逐包
+生效；`"on"`（默认）时 Server 的 TSO 大帧原样到达路由器，NetEm 每次丢掉或
+重排一整个大帧。要逐包随机丢包就写 `"off"`，代价是吞吐上限约
+100-150 Mbit/s（见 `docs/04-performance-report.md` 第 2.3 节）。
+
 | Manifest | 用途 |
 |---|---|
 | `smoke.toml` | 最小正确性冒烟 |
 | `target-box.toml` | 目标部署环境网格（核心性能结果来源） |
 | `target-box-rtt300-samples.toml` | 高 RTT 点加样本，提升该点的统计置信度 |
 | `bandwidth-sweep.toml` | 带宽敏感性 |
-| `neutrality.toml` | 中性性检查（模块全关 vs 内核原生 CUBIC，零丢包） |
+| `neutrality.toml` | 中性性检查：模块全关（`b2-skyline-base`）对内核 CUBIC（`b1-controlled-cubic`），另有模块全开的 `skyline-best` 作参照；门槛只看 `line-rate`（`analyze_results.py` 的 `parity_scenario`）；`dc-lowrtt` 一并报告但不作门槛，另有 `light-loss`（0.1%）与 `primary`（0.5%）两个轻丢包场景 |
 | `guardrail-gain-ab.toml` | 隔离验证 `guardrail_gain` 系数的作用 |
 | `rto-max-validation.toml` | 隔离验证 M1 tier-2 RTO 上限机制的作用 |
 | `rto-max-smoke.toml` | RTO 上限机制端到端冒烟 |
@@ -71,7 +77,7 @@ infra/wait-for-guests.sh
 infra/kernel/fetch-source.sh
 infra/kernel/build.sh
 infra/kernel/deploy.sh build/kernel --confirm-install-kernel
-# 两台 guest 重启并确认 uname -r 满足 docs/01-deployment-guide.md 第 2 节
+# 两台 guest 重启并确认 uname -r 满足 DEPLOY.md 第 1.3 节
 # 的内核版本要求后，在宿主仓库根目录（不是 guest 上——cloud-init 镜像本身
 # 不包含仓库 checkout，infra/install-guest.sh 要求在运行它的机器本地就是
 # 仓库根目录，这个前提在这套测试床上不成立）：

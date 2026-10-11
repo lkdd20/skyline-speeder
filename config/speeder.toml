@@ -14,23 +14,47 @@ prr_pacing_enabled = true
 # prr_pacing_enabled's comment -- same rationale, same independent-switch
 # shape). Set to false only for rollback/A-B comparison.
 auto_pacing_enabled = true
+# Congestion control for new connections whenever skyline_cc is not attached:
+# every enable writes it before the attach, and `ssctl drain` and the enable
+# unit's ExecStop write it on the way out. It must be registered
+# (/proc/sys/net/ipv4/tcp_available_congestion_control) or a module tcp_<name>
+# the kernel loads when the sysctl is written -- xanmod builds cubic that way.
+# install.sh replaces cubic in a config it creates with the algorithm the
+# host's sysctl configuration selects at boot (bbr on most VPS images), so
+# detaching leaves the host on what it ran; an existing file is never rewritten.
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000
-max_queue_delay_ms = 100
+max_queue_delay_ms = 70
 # Ratio of base RTT added to max_queue_delay_ms to form the actual guardrail
-# (max of the two -- see skyline_max_queue_delay_us() in bpf/skyline_cc.bpf.c). 1.0
-# lets the guardrail widen automatically on higher-RTT paths instead of
-# staying pinned to the fixed 100ms floor, which is what makes the much
-# higher cruise_inflight_gain/cruise_pacing_gain below safe on the target
-# box's 100-300ms-RTT scenarios they were tuned against.
-max_queue_delay_ratio = 1.0
+# (max of the two -- see skyline_max_queue_delay_us() in bpf/skyline_cc.bpf.c), so
+# the guardrail still widens on higher-RTT paths instead of staying pinned to
+# the fixed floor. 70ms / 0.6 replaced 100ms / 1.0 after tuning on a
+# production deployment (many concurrent flows, roughly 100-150ms base RTT):
+# there the standing queue a flow could build topped out just under the old
+# threshold, so the one congestion signal this controller accepts almost
+# never fired. 100ms / 1.0 is what docs/04-performance-report.md measured.
+max_queue_delay_ratio = 0.6
 # Aggressive initial window (see bpf/include/skyline_abi.h's
 # initial_cwnd_packets doc comment) -- standard IW10 slow-start takes ~7
 # RTTs (2.1s at 300ms RTT) to reach 1000 packets, too slow for the target
 # box's high-RTT corner. 0 disables this (falls back to the kernel's own
 # initial window).
 initial_cwnd_packets = 100
+# Floor under M2's BDP-derived cwnd target (see bpf/include/skyline_abi.h's
+# min_cwnd_packets doc comment). A thin or app-limited flow's
+# bw_bps * base_rtt comes out below a handful of packets, and a window that
+# small can only recover from a loss through a tail-loss probe or an RTO.
+# It is also where a short response restarts after an RTO: such a flow
+# usually never gets a bandwidth estimate, and the kernel leaves it one
+# packet. Pacing (M4) still sets the send rate of any flow that has an
+# estimate, so raising this does not make one send faster. 32 packets
+# (about 46 KB) lets a 15-35 KB response finish in the flight after the
+# timeout, and stays under the roughly 44-packet initial receive window of
+# a Linux client. Omitting the field gives 4, the floor this project always
+# had; must stay within [4, max_cwnd_packets]; only consulted while
+# adaptive-cwnd (M2) is on.
+min_cwnd_packets = 32
 
 # 这两段（[adaptive_cwnd]/[loss_classifier]）的全部数值现在都可以在不重启
 # skyline-speederd 的情况下用 `ssctl set-module-config`/`reset-module-config` 在线覆盖
@@ -41,21 +65,34 @@ initial_cwnd_packets = 100
 # 不是目标）：M2 是 STARTUP/CRUISE 两态状态机，开启时直接掌管全部 CA 状态下
 # 的 cwnd（不被 PRR 接管），cruise_inflight_gain/cruise_pacing_gain 是 CRUISE
 # 终态的增益系数。见 bpf/include/skyline_abi.h 顶部注释与 docs/03-design.md。
+#
+# 下面这组默认值来自一台生产部署上的交替对照调参（大量并发连接、基准 RTT 约
+# 100-150ms、丢包以拥塞型为主而不是纯随机），不是来自测试台矩阵；
+# docs/04-performance-report.md 测的是调整之前的那组系数（见该文 3.4 节）。
+# 链路确实是 10%-20% 纯随机丢包时，用 docs/usage.md 的「高随机丢包档」。
 [adaptive_cwnd]
-min_rtt_window_s = 10
-bw_window_rtts = 10
-startup_plateau_rtts = 3
-startup_growth_ratio = 0.25
+# min-RTT 窗口：CRUISE 增益恒 >= 1.0 且没有排空阶段，窗口太短时基准 RTT 会把
+# 这条流自己堆出来的常驻队列算进去，护栏阈值和 cwnd 目标跟着往上漂。
+min_rtt_window_s = 30
+# 带宽估计取最近几轮的峰值：窗口越长，被 ACK 压缩抬高的样本、瓶颈变窄之前的
+# 旧速率被记住得越久，pacing 速率就越容易脱离链路当前真实交付的速率。
+bw_window_rtts = 6
+# STARTUP 退出判定：连续这么多轮带宽涨幅低于 startup_growth_ratio。受应用限速
+# 的轮次同样会被算作"没涨"，判定太急会让流带着偏低的带宽估计永久进入 CRUISE。
+startup_plateau_rtts = 5
+startup_growth_ratio = 0.20
 # SKYLINE_MODE_STARTUP 的单一增益（cwnd 目标和 pacing 速率共用）。
 startup_gain = 3.0
 # SKYLINE_MODE_CRUISE 的 cwnd 目标增益——刻意比 cruise_pacing_gain 更宽松，
-# cwnd 只需要不成为限制因素，真正的限速器是 pacing。在目标环境网格上按
-# 吞吐与自伤风险权衡选定：更激进的候选在测试台带宽上限下没有带来提升，
-# 反而在高 RTT/高丢包点因过量发送略有下降；这组取值与更保守的候选相比
-# 吞吐持平或更优，且在真实拥塞型瓶颈上自伤风险更低。
-cruise_inflight_gain = 2.0
-# SKYLINE_MODE_CRUISE 的 pacing 速率增益——M4 开启时真正生效的限速值。
-cruise_pacing_gain = 1.1
+# cwnd 只需要不成为限制因素，真正的限速器是 pacing。生产部署上退回 2.0 时
+# RTO 超时明显增多（窗口余量不够，丢包后更容易只剩等超时这一条路），再加到
+# 4.0 没有看到额外收益。
+cruise_inflight_gain = 3.0
+# SKYLINE_MODE_CRUISE 的 pacing 速率增益——M4 开启时真正生效的限速值。CRUISE 是
+# 终态且没有周期性探测，带宽估计只能靠这个 > 1.0 的增益往上刷新，增益太低时
+# 估计值爬升很慢。1.25 是和收紧后的丢包补偿/护栏一起选定的：不收紧那两项、
+# 单独调高它只会增加重传而换不来速度，再往上（1.4）同样如此。
+cruise_pacing_gain = 1.25
 # 队列时延/ECN 护栏触发时对 cwnd 目标和 pacing 速率共同生效的增益——
 # 这是 Skyline Speeder 唯一还承认的真实拥塞信号，触发时不该只是"停止加速"（增益回到
 # 1.0），而应该主动降速。0.8 = 降到测得带宽的 80%，是一个尚待用小规模实验
@@ -66,9 +103,12 @@ guardrail_gain = 0.8
 [loss_classifier]
 # M3 是单一丢包率补偿系数（1/(1-p)，见 bpf/skyline_cc.bpf.c 的
 # skyline_loss_inflation_permille() 文档注释），不做多路丢包分类——目标环境下
-# "永远不因丢包降窗"才是正确答案。0.5 = 补偿到测得丢包率50%封顶
-# （2.0x），覆盖目标环境的10-20%丢包上界并留出重传开销的余量。
-loss_inflation_max_ratio = 0.5
+# "永远不因丢包降窗"才是正确答案。补偿封顶 0.10（最多 1.11x）：足够抵消
+# 个位数百分比随机丢包造成的带宽低估。封顶放得更高时，它在拥塞型瓶颈上是一条
+# 正反馈——丢得越多补得越多、发得越多、丢得更多，只有护栏能打断。链路确实是
+# 10%-20% 纯随机丢包（docs/04-performance-report.md 测的环境）时调回 0.5
+# （2.0x，覆盖该丢包上界并留出重传开销的余量）。
+loss_inflation_max_ratio = 0.10
 
 # [rack_tuning]
 # 全局 RACK sysctl 默认值。留空/整段省略 = skyline-speederd 不接管，所有权交给实验矩阵
@@ -80,8 +120,9 @@ loss_inflation_max_ratio = 0.5
 
 # M1 per-flow 动态 RTO 下限（TCP_BPF_RTO_MIN），由 skyline_policy.bpf.c 在
 # BPF_SOCK_OPS_RTT_CB 里应用。目标环境下更快的丢包检测能直接减少停顿，
-# 默认开启（实验矩阵仍会按 case 通过 `ssctl set-rack-rto` 覆盖，见
-# config/speeder-guest.toml）。
+# 这里设为开启（实验矩阵仍会按 case 通过 `ssctl set-rack-rto` 覆盖，见
+# config/speeder-guest.toml）。daemon 启动时不下发这一段：要执行一次
+# `ssctl reset-rack-rto` 才生效，每次 daemon 重启后都一样。
 [rack_rto]
 enabled = true
 srtt_permille = 1100    # target = max(srtt_us, min_rtt_us) * this / 1000
@@ -110,6 +151,44 @@ rto_max_congestion_ratio_permille = 0  # 0 = 使用内置默认 2000（即 srtt 
 enabled = false
 dscp_value = 0
 
+# First-flight redundancy. While skyline_cc is enabled, bpf/skyline_tc.bpf.c
+# (TC egress on runtime.tc_interface) sends every SYN-ACK, every SYN of a
+# skyline_cc socket and every segment that starts within the first first_kib
+# KiB a skyline_cc connection sends twice: the original at once, a copy
+# delay_ms later. On a lossy path a short response spends most of its time
+# waiting for loss recovery -- a tail-loss probe after about two RTTs, an RTO
+# after about three, the kernel's fixed one-second SYN-ACK timeout -- and a
+# late second copy turns most of those losses into a delay of delay_ms. The
+# price: a response that fits in first_kib is sent twice; a bulk transfer
+# pays for its first first_kib only. The copy is held back by the fq qdisc
+# (kept at the root by [guard]); two copies a few milliseconds apart are lost
+# together far less often than two back to back (delay_ms = 0). Connections
+# that do not run skyline_cc are never copied, and nothing is copied before
+# `ssctl enable` or after `ssctl drain`. Omitting the table keeps it on with
+# these values; `ssctl set-redundancy` / `reset-redundancy` change it live.
+[redundancy]
+enabled = true
+first_kib = 64   # 1..=1024
+delay_ms = 10    # 0..=100
+
+# While skyline_cc is enabled, skyline-speederd re-checks every interval_s
+# seconds that the host default congestion control is still skyline_cc and (if
+# qdisc = true) that net.core.default_qdisc and the root qdisc of
+# runtime.tc_interface are still fq, and puts back whatever something else
+# changed -- a `sysctl --system` that re-applies a "one-click BBR" file, a tc
+# command that installs cake/fq_pie. `ssctl enable` applies all of it once
+# regardless. 0 turns the periodic re-check off. A root qdisc that looks built
+# on purpose (htb, tbf, netem, prio, mqprio, a cake with a bandwidth, ...) is
+# left alone and reported under "guard" in `ssctl status`; `ssctl drain` stops
+# the guard. When runtime.tc_interface is a VLAN, bond or bridge (root noqueue,
+# the kernel default there), the NICs under it are checked instead -- never a
+# VM's tap or a container's veth.
+[guard]
+interval_s = 5
+# false leaves every qdisc alone (skyline-speederd then owns only the
+# congestion control).
+qdisc = true
+
 [runtime]
 bpf_dir = "build/bpf"
 pin_dir = "/sys/fs/bpf/skyline-speeder"
@@ -117,4 +196,8 @@ cgroup_path = "/sys/fs/cgroup/skyline-speeder"
 socket_path = "/run/skyline-speeder/speeder.sock"
 state_path = "/run/skyline-speeder/state.json"
 events_path = "/run/skyline-speeder/events.jsonl"
+# /run is a RAM-backed tmpfs shared with the rest of the host. Past this many
+# MiB the event log is rotated to events.jsonl.1 (one old file kept), so it
+# never holds much more than twice this. 0 turns the event log off.
+events_max_mib = 8
 tc_interface = "data0"

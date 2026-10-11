@@ -4,10 +4,13 @@
 #ifndef __SKYLINE_ABI_H
 #define __SKYLINE_ABI_H
 
-/* ABI version for struct skyline_config / struct skyline_flow_state below. The BPF
- * object and its userspace loader must agree on this value --
- * skyline_config_get_slot() in skyline_cc.bpf.c checks it and returns NULL on a
- * mismatch rather than misinterpreting the struct layout.
+/* ABI version for struct skyline_config / struct skyline_flow_state /
+ * struct skyline_metrics below. The BPF object and its userspace loader must
+ * agree on this value -- skyline_adopt_config() in skyline_cc.bpf.c checks it
+ * and adopts nothing on a mismatch rather than misinterpreting the struct
+ * layout, so skyline_cc then leaves every connection's cwnd and pacing alone.
+ * Nothing reports that: it only shows as connections that are on skyline_cc
+ * and are never adjusted.
  *
  * The target deployment environment is fixed: 10-20% sustained random loss,
  * 100-300ms RTT, fairness explicitly not a goal. M2 owns cwnd directly in
@@ -23,7 +26,7 @@
  * skyline_set_cwnd_target()/skyline_apply_pacing() use (`guardrail_gain_permille`),
  * not by cutting cwnd.
  */
-#define SKYLINE_ABI_VERSION 6
+#define SKYLINE_ABI_VERSION 8
 #define SKYLINE_EVENT_RING_SIZE (1U << 20)
 
 enum skyline_feature {
@@ -89,8 +92,11 @@ enum skyline_event_type {
      */
     /* Emitted by skyline_update_model() every time the queue-delay/ECN guardrail
      * actually trips (see flow->queue_clamped's doc comment), whether or not
-     * this changes flow->mode. value_a = queue_delay (us), value_b =
-     * max_queue_delay_us, state = flow->mode at trip time.
+     * this changes flow->mode -- one for each guardrail_hits it counts.
+     * value_a = queue_delay (us), value_b = max_queue_delay_us, state =
+     * flow->mode at trip time. A trip with value_a <= value_b, or with
+     * value_b = 0 (the queue check switched off), came from a fresh ECN CE
+     * mark, not from the queue delay.
      */
     SKYLINE_EVENT_GUARDRAIL = 9,
     /* Emitted on every skyline_undo_cwnd() struct_ops call (kernel decided a
@@ -100,11 +106,12 @@ enum skyline_event_type {
      * flow->mode.
      */
     SKYLINE_EVENT_UNDO_CWND = 10,
-    /* Emitted in skyline_cong_control() when a flow adopts a new config slot
-     * mid-connection (the double-buffer switch guarding against a torn
-     * read within a round -- see skyline_reset_generation()). value_a = old
-     * generation, value_b = new generation, state = flow->mode before the
-     * switch.
+    /* Emitted in skyline_cong_control() when a flow adopts a newer
+     * configuration mid-connection, at a round boundary (see
+     * skyline_adopt_config() and skyline_reset_generation()). value_a = old
+     * generation, value_b = new generation -- configurations published
+     * while the flow was in one round are skipped, not adopted one by one --
+     * state = flow->mode before the switch.
      */
     SKYLINE_EVENT_GENERATION_SWITCH = 11,
 };
@@ -155,23 +162,50 @@ struct skyline_config {
      * disabled (inflation always exactly 1000 = 1.0x).
      */
     __u32 loss_inflation_max_permille;
-    /* Gain applied to BOTH the cwnd target (skyline_set_cwnd_target()) and
-     * the pacing rate (skyline_apply_pacing()) for the rest of a round in which
-     * flow->queue_clamped trips (queue-delay guardrail exceeded, or a fresh
-     * ECN CE mark) -- the one signal Skyline Speeder still treats as genuine congestion.
-     * 0 = unset (identity: gain stays neutral at 1000 = 1.0x -- "stop
-     * inflating" but never actually cut). A deliberately-set value below
-     * 1000 makes this guardrail a real, self-protective cut instead of just
-     * a ceiling on the boost, applied uniformly to both cwnd and pacing so
-     * the protection has teeth regardless of which of M2/M4 happen to be
-     * enabled.
+    /* Gain for the rest of a round in which flow->queue_clamped trips
+     * (queue-delay guardrail exceeded, or a fresh ECN CE mark) -- the one
+     * signal Skyline Speeder still treats as genuine congestion. Only M2
+     * evaluates the guardrail, so with M2 off this never applies. It takes
+     * the place of the mode gain in both places one is used, but not in the
+     * same way: the pacing rate (skyline_apply_pacing(), M4) becomes
+     * bw_bps x this, M3's loss inflation dropped along with the mode gain;
+     * the cwnd target (skyline_set_cwnd_target()) becomes BDP x this x M3's
+     * loss inflation, which skyline_bdp_packets() still applies. 0 = unset
+     * (identity: 1000 = 1.0x -- "stop inflating" but never an actual cut). A
+     * value below 1000 makes the guardrail a real, self-protective cut
+     * instead of just a ceiling on the boost.
      */
     __u32 guardrail_gain_permille;
+    /* Floor under M2's BDP-derived cwnd target (skyline_set_cwnd_target()/
+     * skyline_bdp_packets()). bw_bps * base_rtt comes out below a handful of
+     * packets for any thin or app-limited flow, and a window that small has
+     * no way to recover from a loss except a tail-loss probe or an RTO --
+     * there are not enough packets behind the hole to produce the SACK
+     * feedback RACK needs. Pacing (M4) still sets the send rate, so raising
+     * this does not make a flow send faster; it only stops cwnd from being
+     * what holds back a retransmission. It is also the floor after an RTO
+     * for a flow that has no bandwidth estimate yet -- typically a response
+     * that fits in its first flight, whose rate samples are all app-limited
+     * -- where tcp_enter_loss() would otherwise leave it slow-starting from
+     * a single packet. Never goes below SKYLINE_MIN_CWND
+     * (skyline_min_cwnd() takes the max of the two), and is deliberately not
+     * consulted on the M2-off path, which keeps the fixed SKYLINE_MIN_CWND so
+     * this knob cannot perturb B1/B2 neutrality.
+     */
+    __u32 min_cwnd_packets;
+    /* Explicit tail padding: the __u64 above makes the struct 8-byte
+     * aligned, and the Rust mirror (KernelConfig) is bytemuck::Pod, which
+     * rejects implicit padding. Always 0.
+     */
+    __u32 reserved;
 };
 
 struct skyline_flow_state {
-    __u32 generation;
-    __u32 config_slot;
+    /* The config_seq that published `config` below -- see
+     * skyline_adopt_config() in skyline_cc.bpf.c. Compared with the current
+     * one at every round boundary.
+     */
+    __u32 config_seq;
     __u32 mode;
     __u32 counted;
     __u32 round_count;
@@ -250,14 +284,25 @@ struct skyline_flow_state {
     __u32 last_loss_rate_delivered;
     /* One-shot-per-round clamp set by skyline_update_model() when the queue-
      * delay guardrail trips or a fresh ECN CE mark lands -- the only thing
-     * still allowed to restrain a loss-tolerant flow. Consumed (as "force
-     * gain back to neutral 1.0x this round") by skyline_set_cwnd_target() and
-     * skyline_apply_pacing(), then recomputed fresh next round -- deliberately
-     * not sticky: a one-shot clamp that reasserts itself every round a real
-     * signal is present is exactly as protective, without the risk of a
-     * sticky mode never finding a clean exit condition under sustained loss.
+     * still allowed to restrain a loss-tolerant flow. Consumed by
+     * skyline_set_cwnd_target() and skyline_apply_pacing(), which use
+     * guardrail_gain_permille instead of the mode gain for the rest of the
+     * round (see that field's doc comment), then recomputed fresh next
+     * round -- deliberately not sticky: a one-shot clamp that reasserts
+     * itself every round a real signal is present is exactly as protective,
+     * without the risk of a sticky mode never finding a clean exit condition
+     * under sustained loss. Only set while M2 is on.
      */
     __u32 queue_clamped;
+    /* The flow's own copy of the configuration it runs on, taken by
+     * skyline_adopt_config() at skyline_init() and then only at a round
+     * boundary. Every coefficient the flow reads comes from here, never from
+     * config_slots directly, so a configuration published in the middle of
+     * a round cannot change a value under the flow before the round ends --
+     * however many are published, and however long the flow sits idle.
+     * abi_version != SKYLINE_ABI_VERSION means none has been adopted yet.
+     */
+    struct skyline_config config;
 };
 
 struct skyline_metrics {
@@ -266,6 +311,12 @@ struct skyline_metrics {
     __u64 loss_events;
     __u64 state_transitions;
     __u64 pacing_updates;
+    /* Rounds in which the queue-delay/ECN guardrail tripped (see
+     * flow->queue_clamped): at most one per flow and round, so it is a share
+     * of guardrail_rounds, not of ack_events. Each one is also a
+     * SKYLINE_EVENT_GUARDRAIL. Before ABI 8 this counter also took every ACK
+     * that ended with cwnd at max_cwnd_packets, which is cwnd_cap_hits now.
+     */
     __u64 guardrail_hits;
     __u64 hypothetical_early_loss;
     /* How many times skyline_apply_prr() set tp->snd_cwnd (M2-off path only --
@@ -277,6 +328,16 @@ struct skyline_metrics {
      * ring buffer.
      */
     __u64 prr_adjustments;
+    /* Rounds in which the guardrail was checked: every new round of a flow
+     * with M2 on. What guardrail_hits is a share of.
+     */
+    __u64 guardrail_rounds;
+    /* ACKs after which snd_cwnd was at or above max_cwnd_packets -- per ACK,
+     * so a share of ack_events. A ceiling, not a congestion signal: a flow
+     * whose BDP x gain exceeds the cap adds one on every ACK for as long as
+     * that lasts.
+     */
+    __u64 cwnd_cap_hits;
 };
 
 struct skyline_event {
@@ -298,9 +359,9 @@ struct skyline_tc_stats {
 /* M1 per-flow dynamic RTO floor + ceiling tuning. Deliberately independent
  * of struct skyline_config / SKYLINE_ABI_VERSION: this value changes at most once
  * per experiment case (not every round), so it carries none of the "torn
- * read mid-round" risk that motivates skyline_cc.bpf.c's config_slots double
- * buffer. A single array-map slot, fully overwritten on each update, is
- * sufficient.
+ * read mid-round" risk that motivates skyline_cc.bpf.c's double-buffered
+ * config_slots and per-flow copies. A single array-map slot, fully
+ * overwritten on each update, is sufficient.
  *
  * The rto_max_* fields below drive a second, independent knob --
  * TCP_RTO_MAX_MS, the actual RTO backoff ceiling (~120s by kernel default;
@@ -456,6 +517,67 @@ struct skyline_retransmit_dscp_stats {
                                    * shows genuine IPv6 TCP traffic exists, is the actual
                                    * signal worth investigating.
                                    */
+};
+
+/* First-flight redundancy, carried out by skyline_tc.bpf.c: every SYN-ACK
+ * this host sends, every SYN a skyline_cc socket sends, and every segment of
+ * a skyline_cc connection that starts within the first `bytes` of what the
+ * connection has sent goes out twice -- the original at once, a copy
+ * `delay_us` later.
+ *
+ * Why: on a lossy long-haul path a short response spends most of its life
+ * waiting for loss recovery, not transferring. A 15-35 KB response fits in
+ * the initial window and needs one RTT; a lost segment in it costs another
+ * RTT at best (fast retransmit), two or three when it is the tail (TLP after
+ * about two RTTs, RTO after about three), and a lost SYN-ACK costs the
+ * kernel's fixed one-second initial timeout. None of those timers belong to
+ * a congestion control. A second copy of the same segment turns "lost" into
+ * "arrived a little late" for everything but losses that hit both copies.
+ *
+ * Why the copy is late: back-to-back duplicates are dropped together by the
+ * same burst of loss far more often than two copies a few milliseconds
+ * apart. The delay is an EDT timestamp on the copy, which the fq qdisc holds
+ * it to (skyline-speederd keeps fq at the root while enabled, see [guard]);
+ * under any other qdisc the copy leaves at once.
+ *
+ * How the copy is made: bpf_clone_redirect() back to the same device. The
+ * clone has no socket and goes through this same egress hook again, marked
+ * in skb->cb[0] with SKYLINE_REDUNDANCY_TAG, which is where it gets its
+ * timestamp -- a packet with a socket is never taken for a copy, and a copy
+ * is never copied again.
+ *
+ * Cost: the first `bytes` of every connection a second time -- up to one
+ * GSO packet more, since a segment is copied when it starts inside the
+ * range -- plus every retransmission of that range and every SYN or SYN-ACK,
+ * retransmitted ones included. There is no per-connection bound: a
+ * connection that keeps losing segments in its first `bytes` keeps paying
+ * for their copies. A response that fits in `bytes` is sent twice; a bulk
+ * transfer pays for its first `bytes` and the retransmissions among them.
+ *
+ * `enabled` is what the program acts on and is written by skyline-speederd,
+ * not taken from the configuration file as-is: 1 only while skyline_cc is
+ * enabled and [redundancy] enabled = true, 0 at daemon start and from Drain
+ * on, so SYN-ACKs of a host that is back on fallback_cc are not copied.
+ * Independent of struct skyline_config / SKYLINE_ABI_VERSION for the same
+ * reason as struct skyline_retransmit_dscp_config above: a single
+ * fully-overwritten slot that changes at most once per command.
+ */
+#define SKYLINE_REDUNDANCY_ABI_VERSION 1
+#define SKYLINE_REDUNDANCY_TAG 0x5d0b1e5dU
+
+struct skyline_redundancy_config {
+    __u32 abi_version;
+    __u32 enabled;   /* 0 = off (safe default; also the zero-init value) */
+    __u32 bytes;     /* copy segments starting within the first `bytes` sent */
+    __u32 delay_us;  /* the copy leaves this long after the original */
+};
+
+struct skyline_redundancy_stats {
+    __u64 packets;       /* copies made (a GSO super-packet counts once) */
+    __u64 bytes;         /* skb->len of those copies: a GSO super-packet's headers once */
+    __u64 handshakes;    /* subset of packets: SYN-ACKs and SYNs */
+    __u64 clone_failed;  /* bpf_clone_redirect() refused -- no copy sent */
+    __u64 abi_mismatch;  /* config slot's abi_version didn't match; nothing copied */
 };
 
 #endif

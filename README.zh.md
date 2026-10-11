@@ -2,13 +2,13 @@
 
 # Skyline Speeder
 
-**服务器发送端 TCP 加速：eBPF struct_ops 拥塞控制 + Rust 控制面**
+**面向高丢包、高延迟链路的单边 TCP 加速，基于 eBPF**
 
-*Sender-side TCP acceleration. eBPF struct_ops congestion control with a Rust control plane. Clients need no changes.*
+*Sender-side TCP acceleration for high-loss, high-latency links, built on eBPF. Clients need no changes.*
 
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#内核版本要求)
-[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-red.svg)](install.sh)
+[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20RHEL%20%7C%20Alpine-red.svg)](install.sh)
 [![eBPF](https://img.shields.io/badge/eBPF-CO--RE%20struct__ops-green.svg)](bpf/)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-black.svg)](rust-toolchain.toml)
 
@@ -16,9 +16,9 @@
 
 ---
 
-### 由 **Skyline Connect** 独家冠名
+### 由 **[Skyline Connect](https://www.skylineconnect.io)** 独家冠名
 
-*Exclusively sponsored by Skyline Connect*
+*Exclusively sponsored by [Skyline Connect](https://www.skylineconnect.io)*
 
 ---
 
@@ -26,55 +26,77 @@
 
 ## 这是什么
 
-Skyline Speeder 是一套**只需部署在 TCP 连接服务器发送端**的加速方案——客户端保持标准 TCP，不需要任何改动，也不需要任何客户端软件。
+Skyline Speeder 是一套单边 TCP 加速软件：以 eBPF 程序的形式只运行在发送数据的服务器上，面向丢包严重、往返时延长、标准 TCP 在其上几乎跑不起来的链路。它的做法是让发送速率保持在这条路径实际能交付的水平，而不是每丢一个包就把速率砍下来，以此提高这类链路上的吞吐。接收端不做任何改动。
 
-四个组成部分：
+### 原理
 
-| 组件 | 形态 | 作用 |
-|---|---|---|
-| `skyline_cc` | eBPF struct_ops 拥塞控制 | 自适应 cwnd + 丢包率补偿 + pacing |
-| `skyline_policy` | cgroup sockops | 早期丢包感知，动态调节 RTO 下限/上限 |
-| `skyline_tc` | TC egress 程序 | 重传包 DSCP 标记与统计 |
-| `skyline-speederd` / `ssctl` | Rust 用户态 | 常驻控制面与命令行 |
+BBR 靠估计带宽而不是对每次丢包作出反应，但它仍会向丢包让步：内核里的 BBR 每次进入丢包恢复都会先退到"包守恒"（收到几个确认才发几个包），每次超时重传后更是从 1 个包重新开始。在一条与排队无关、随机丢掉 10%-20% 报文的链路上，丢包恢复和超时成了常态，RTT 在 100-300 ms 时它的吞吐逐次运行起伏很大，经常直接崩掉。Skyline Speeder 在发送端用 eBPF 实现的 `tcp_congestion_ops`（`struct_ops`）替换拥塞控制，并只基于一个前提：**丢包本身不携带拥塞信息。**
 
-适用场景：**带宽充足、存在非拥塞性随机丢包的单向长流**。
+- **速率来自测量，而不是丢包。** 每一轮测量投递速率（取最近几轮的峰值）和基准 RTT；每个 ACK 到来时，在包括丢包恢复在内的所有 TCP 状态下，直接把窗口设为 `带宽 × 基准 RTT × 增益`。丢包本身永远不会让窗口缩小，也没有需要慢慢爬出来的"包守恒"阶段。
+- **丢包补偿。** 在丢包率为 `p` 的路径上，投递速率比实际需要发送的量少了 `(1 - p)`。窗口和速率会按这条流自己测得的丢包率放大 `1 / (1 - p)`，最多放大到配置的上限。
+- **Pacing。** 数据经 `fq` 队列以 `带宽 × 增益 × 补偿系数` 的速率均匀发出，而不是成批倾泻，并受硬性速率上限约束；窗口只需要不成为瓶颈。
+- **两个阶段。** STARTUP 用较高的增益尽快摸到路径带宽；带宽连续几轮不再增长后，进入 CRUISE。
+- **拥塞护栏。** 只有两个信号算真实拥塞：排队时延超过阈值（固定值与基准 RTT 的一定比例取较大者），以及 ECN 标记。任一出现，这一轮的增益就降到 `guardrail_gain`，低于测得的带宽；下一轮信号消失即恢复。
+- **有上限的 RTO**（可选）。一个 cgroup sockops 程序按连接限制内核的重传超时，避免线路抖一下就让连接最长等上两分钟。
+- **首轮冗余**（默认开启）。在这样的链路上，拖慢短响应的不是窗口，而是等丢包恢复：尾丢探测约两个往返、重传超时约三个往返、丢了 SYN-ACK 固定等一秒。一个 TC 出方向程序把每条 skyline_cc 连接的握手包和前 64 KiB 各发两份，第二份比原包晚 10 ms，丢一个包只多等这几毫秒，而不是等一个计时器。代价是每条连接约多发 64 KiB，这段范围内有重传时更多（重传的段也各复制一份）。
+
+Rust 编写的 `skyline-speederd` 负责加载 BPF 对象（每个对象加载时都要过内核验证器），并通过双缓冲槽在线下发新系数，每条流在 RTT 边界切换过去；`ssctl` 是它的命令行。
 
 > [!IMPORTANT]
-> 自保护机制只识别两个真实拥塞信号：队列时延增长与 ECN 标记。**如果链路的丢包本质来自网络设备排队**（而非无线链路层这类与排队无关的随机丢失），丢包补偿机制与排队护栏会有**相反的作用方向**。部署前请评估目标链路的丢包性质——固定速率 UDP 打流零丢包而 TCP 大量重传，通常意味着丢包是自身突发造成的排队溢出，而非随机丢包。
+> **这个前提只对与排队无关的丢包成立。** 如果链路的丢包其实是拥塞瓶颈上的排队溢出，丢包补偿与排队护栏会朝相反方向用力，只会更糟。简单判断：固定速率的 UDP 打流不丢包、TCP 却大量重传，说明丢包是自身突发造成的排队溢出，这时不该用本工具。它也不追求公平：不会刻意和竞争的流平分链路。
 
 ## 实测性能
 
-测试床：双 VM KVM，内核 6.12.101，`htb` + `netem` 注入链路条件，固定随机数种子。链路 100 Mbit/s。
+bbr、[tcp-brutal](https://github.com/HyNetworks/tcp-brutal) 与 skyline_cc 在一条真实跨境链路上的对比，三者都只部署在服务端，通过同一套按目的地前缀的路由覆盖生效，客户端全程使用原生 TCP。
 
-**目标环境 9 点网格（Mbit/s 中位数）**
+| | 位置 | 角色 |
+|---|---|---|
+| **服务端** | **新加坡** KVM VPS · 10 Gbps | 发送方，唯一被加速的一端 |
+| **客户端** | **阿里云** ECS，**华南（广东）** · 200 Mbps | 接收方，原生 TCP，不做任何改动 |
 
-| 场景 | 内核 CUBIC | 原生 BBR | **Skyline Speeder** | vs BBR |
-|---|---:|---:|---:|---:|
-| `rtt100-loss10` | 0.31 | 84.28 | **95.36** | +13% |
-| `rtt100-loss20` | 0.17 | 3.54 | **94.92** | **26.8x** |
-| `rtt200-loss15` | 0.12 | 30.89 | **95.04** | **3.1x** |
-| `rtt200-loss20` | 0.10 | 21.16 | **95.13** | **4.5x** |
-| `rtt300-loss15` | 0.10 | 10.88 | **79.44** | **7.3x** |
-| `rtt300-loss20` | 0.05 | 3.48 | **79.92** | **23.0x** |
+RTT 70-73 ms、丢包 10%-30%，测于晚高峰。skyline_cc 使用 0.1.0 时随附的默认系数，即现在 [使用与调参指南](docs/usage.md) 里的「高随机丢包档」；**当前的默认系数没有在这条链路上测过**。tcp-brutal 为 v2.0.0，速率 200 Mbps；bbr 为内核自带版本。
 
-**9/9 点主判据与稳健性判据全部通过**，全部远超"至少领先 5%"的验收线。高 RTT 端加样本到 `n=5` 后，Skyline Speeder 自身变异系数均在 4% 以内。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/single-ended-ataglance-dark.svg">
+  <img alt="以 bbr 为基线，tcp-brutal 与 skyline_cc 在游戏、视频、网页、大文件四类场景下的相对表现" src="docs/images/single-ended-ataglance-light.svg">
+</picture>
 
-其余关键结论：
+8 轮 × 3 算法 × 5 场景 = 120 次运行，119 次完成。每轮轮换算法顺序，避免链路在测试中劣化时偏袒先跑的那个。各场景赢家按轮统计：
 
-- **中性性成立**：四个模块全部关闭时，与内核原生 CUBIC 在零丢包场景差异 **<0.01%**——关闭路径没有引入任何系统性偏差。
-- **护栏无回归**：`guardrail_gain=0.8` 的自保护降速，在最容易触发护栏的 0% 丢包场景与"不降速"对照组差异 <0.01%。
-- **RTO 上限有实测证据**：无上限对照组（含纯内核默认 BBR）实测到 RTO 被顶到约 **101 秒**，逼近内核 120 秒默认上限；有上限配置 3/3 全部存活。
-- **已知劣势**：`reorder-dsack`（纯重排序，不在目标场景内）是唯一不如基线的场景，比 CUBIC 低约 9%、比 BBR 低约 13%。
+| 场景 | 赢家 | 幅度 |
+|---|---|---|
+| **视频**（6 MB 分块 @ 48 Mbps） | **tcp-brutal** | 启动延迟赢 7/8 轮，分块 p95 赢 6/8 轮 |
+| **游戏**（ping-pong，60 msg/s） | **skyline_cc** | 抖动 5/8 轮，卡顿 >150 ms 4/8 轮 |
+| **大文件 · 4 并发** | skyline_cc 与 tcp-brutal，都领先 bbr | 中位数 117 / 115 vs 77 Mbps |
+| **大文件 · 单流** | bbr 与 skyline_cc 打平，tcp-brutal 垫底 | 4/8、4/8、0/8 轮；中位数 59 / 53 / 46 Mbps |
+| **网页加载** | 无稳定赢家 | 逐轮波动大于三者差异 |
+| **服务端重传占比**（占全部发出的报文段，全部场景累计） | bbr 最低 | bbr 9.1%、skyline_cc 10.4%、tcp-brutal 10.9% |
 
-完整方法学见 [性能验证报告](docs/04-performance-report.md)。
+最能说明三种设计差别的是单流结果。**tcp-brutal 发得最多、传得最少：它发出的报文段有 12.2% 是重传，bbr 为 9.0%，skyline_cc 为 10.0%，而它的中位吞吐只有 46 Mbps。** 在 10%-30% 丢包下，它固定的 200 Mbps 远高于这条路径能交付的速率，而"丢了就多发"的开环控制把这个差距全部变成了重传。skyline_cc 自己估计速率，没有一个会被设得过高的目标速率。
+
+> [!NOTE]
+> 这是一条链路上的现场测量，不是本仓库正式结论所依据的受控双 VM 测试床，也不代表你的链路。它 70 ms 的 RTT 还低于本项目 100-300 ms 的目标区间，在这个 RTT 下 bbr 从丢包中恢复要容易得多。请把它当作三种算法行为特点的证据，而不是吞吐量跑分。逐轮数据与原始记录见 [research/experiments/single-ended/](research/experiments/single-ended/)；受控测试床结果见 [性能验证报告](docs/04-performance-report.md)。
+
+### 三者的设计差别
+
+|  | bbr | tcp-brutal | Skyline Speeder |
+|---|---|---|---|
+| 控制结构 | 闭环，探测带宽 | **开环**：速率由你给定 | 闭环，自己估带宽 |
+| 因丢包降速 | 间接 | 否 | 否 |
+| 需要预知链路带宽 | 否 | **是** | 否 |
+| 拥塞自保护 | 有 | 无 | 排队时延 + ECN 护栏 |
+| 形态 | 内核内置 | 内核模块（DKMS） | eBPF CO-RE，过验证器 |
+| 内核门槛 | 任意 | 5.10 | **6.12 LTS** |
+
+如果你知道出口带宽、它基本固定、且内核较老，tcp-brutal 是更简单的答案。Skyline Speeder 适合带宽未知或会变、需要拥塞护栏与可观测性、且能跑 6.12+ 内核的场景。真正拥塞的瓶颈链路上，两者都不合适。
 
 ## 内核版本要求
 
-**精确 ABI 下限是 6.10；实际支持并验证的下限是 6.12 LTS。**
+**Linux 6.12 LTS 或更新**，且 `/sys/kernel/btf/vmlinux` 必须存在。`skyline_cc` 实现的是 4 参数的 `cong_control(sk, ack, flag, rs)` 回调，这个签名自 6.10 才有，更旧的内核会在加载时拒绝该程序。因此 6.1、6.6 两个 LTS 分支，以及 Debian 12 与 Ubuntu 22.04/24.04 的原装内核都不行。
 
-`skyline_cc.bpf.c` 挂在 `tcp_congestion_ops.cong_control` 上的回调用 **4 个参数**声明（`sk, ack, flag, rs`）。该签名自 v6.10 才启用——v6.9 及更早版本该函数指针只有 2 个参数（`sk, rs`），BPF 验证器会在加载时直接拒绝，报错明确指向参数个数不匹配。
+已验证：`6.12.101`、`6.18.42`、`7.1.6` 通过（含 IPv4/IPv6 数据路径冒烟测试）；`6.1.180` 和 `6.6.148` 按设计加载失败。
 
-> **`6.1.x` 和 `6.6.x` 两个 LTS 分支不支持**，两者都停留在旧的 2 参数签名。
+**发行版：** Debian 与 Ubuntu（apt、systemd），Fedora 与 RHEL 系——Rocky Linux、AlmaLinux、CentOS Stream（dnf、systemd），以及 Alpine（apk、OpenRC），内核满足上面的要求即可。一键安装已在 Debian 13、Fedora 43、Rocky Linux 10.2 和 Alpine 3.23 上完整跑通。
 
 ## 快速开始
 
@@ -82,55 +104,74 @@ Skyline Speeder 是一套**只需部署在 TCP 连接服务器发送端**的加�
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
-或者自己克隆下来看过再装（**推荐**，这个脚本会改全机 TCP 行为）：
+Alpine 上以 root 运行——全新的 Alpine 只有 `wget`，没有 `curl` 和 `bash`，引导脚本会把两者装上：
+
+```sh
+wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
+```
+
+> [!NOTE]
+> **一键安装现在默认安装最新发布的预编译版本**：直接使用预编译好的 BPF 对象和 daemon，不会在本机安装编译器、LLVM 或 Rust。v0.4.1 起每个 release 都带 glibc 版和给 Alpine 用的 musl 版两个产物。两个都跑不了时（不是 x86_64，或 glibc 低于 2.38，例如 Debian 12），安装器会说明原因并自动改为从源码构建。想强制从源码构建，或者安装指定版本：
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --source           # 在本机从源码构建
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --release v0.4.0   # 安装该版本，而不是最新版
+> ```
+>
+> v0.4.0 及更早的安装器，不带参数时从源码构建，要装发布版得加 `--prebuilt`；一键安装运行的始终是 `main` 上的安装器，所以已经是新的默认行为。`--prebuilt` 仍然可用，现在的含义是"只装发布版"：本机跑不了发布版时直接停下，不会改为源码构建。
+
+最小化的 Debian 镜像可能没有 `curl`（`apt-get install -y curl`），很多镜像也没有 `sudo`（已经是 root 就去掉）。想先看过脚本再运行（**推荐**，因为它会改变这台机器上所有新建连接的拥塞控制）：
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
 cd skyline-speeder
-sudo ./install.sh
+sudo ./install.sh              # 安装已发布的版本（本机跑不了时才从源码构建）
+sudo ./install.sh --source     # 从这份源码构建
+sudo ./install.sh --prebuilt   # 只装已发布的版本，装不了就停下
+sudo ./install.sh --check      # 只做前置检查，不改动任何东西
+sudo ./install.sh --no-enable  # 安装，但不挂载此前没挂载的 skyline_cc
+sudo ./install.sh --verbose    # 不显示进度条，改为打印每条命令的输出
+sudo ./install.sh --uninstall  # 卸载，把本机切回 bbr + fq，并卸掉安装时装上的包
+                               #   （保留 /etc/skyline-speeder）
+sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
+                               #   安装前那台机器用的拥塞控制与 qdisc
 ```
 
-一键脚本会完成：安装工具链（clang/llvm/libbpf/bpftool/Rust）→ 用**本机内核 BTF** 编译三个 CO-RE BPF 对象 → 构建 Rust 控制面 → 自动探测并写入出口网卡 → 过一遍内核验证器 → 启动并配置开机自启。**不安装任何代理，不监听任何端口。**
+安装器使用发行版自己的包管理器和服务管理器——apt、dnf 或 apk；systemd，Alpine 上是 OpenRC（本文档里的 `systemctl restart skyline-speederd` 在 Alpine 上对应 `rc-service skyline-speederd restart`）。它会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**
 
-```bash
-sudo ./install.sh --check      # 只做前置检查
-sudo ./install.sh --no-enable  # 安装但不挂载 skyline_cc
-sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder 配置）
-```
+`--uninstall` 会先 drain 掉存量连接，删除两个服务（systemd 单元，Alpine 上是 OpenRC 脚本）、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`（Fedora/RHEL 上是 `iproute` 与 `iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有 `bash`），不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 或 dnf 保护的包。卸之前先出计划（apt 自己出，dnf 用 `rpm -e --test`；apk 本来就不会删还被依赖的包）：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
-> [!NOTE]
-> BPF 对象必须在**目标机器本身**编译（或显式指定同版本内核的 BTF），不能搬运在别的内核版本上编译好的 `.bpf.o`。
+已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 有两个构建：一个在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足）；另一个自 v0.4.1 起在 Alpine 3.21 里针对 musl 构建，Alpine 3.21 及更新会装它，外加 `libelf`、`zlib`、`zstd-libs`、`libgcc`。用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
+
+> [!IMPORTANT]
+> **升级：** 再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。原先从源码构建的主机会换成已发布的版本，除非再次带上 `--source`——v0.4.1 起 Alpine 也是如此。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.4.0*。
 
 日常操作：
 
 ```bash
-ssctl status    # 运行时状态、能力集与决策计数器
-ssctl flows     # 逐连接视图
-ssctl drain     # 优雅摘除，等待存量连接自然结束
+ssctl status    # 这台机器被接管了吗？附加状态、全机默认拥塞控制、守护、内核能力
+ssctl flows     # 在加速什么？被加速的连接、它们上面的参数、算法决策计数器
+ssctl drain     # 优雅摘除：新连接改走 fallback_cc，再等存量连接结束
 ```
 
-## cgroup 前提
+两份报告都是给人看的：在终端上带颜色和符号，被管道接走时两样都没有。要给脚本解析就加 `--json`，打印 daemon 的原始应答。
 
-**这是最容易被忽略、也最不容易被发现的一步。** `skyline_policy` 的动态 RTO 调节挂在 `/sys/fs/cgroup/skyline-speeder` 上，只有被迁移进该 cgroup 的进程建立的连接才会经过这段 BPF 代码。**进程不迁移进去不会报任何错误——只是静默不生效**，`ssctl status` 里 `rack_rto.stats.applied` 会一直停留在 0。
+`ssctl flows` 逐条列出内核当前跑在 `skyline_cc` 上的 TCP 连接（已发字节最多的 50 条，其余只给出条数）——对端、RTT、拥塞窗口、pacing 速率、交付速率、已发字节以及其中的重传占比——下面接着是这些连接上生效中的系数，以及算法决策计数器。逐条数据是**内核自己的**，通过 `ss` 读回：skyline_cc 的逐流状态存在 socket storage 里，用户态无法遍历，但 cwnd、pacing 速率和 RTT 恰好就是它写进套接字的那几项。
 
-```bash
-sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命令...>
-```
+通过 SSH 执行 `ssctl drain` 总会走到超时，因为你自己的会话就是一条 skyline_cc 连接。这无害：它在开始等待之前就已经让新连接改走 `fallback_cc`。
 
-`skyline_cc` 是全局 struct_ops、`skyline_tc` 挂在接口级 TC 上，两者都不受此限制。
+## 配置
 
-## 可调项一览
+随附的默认值就是调好的值，**绝大多数部署不需要改**。
 
-装完即是调好的默认值，**绝大多数场景不需要改**。可调的东西分四类：
+**模块。** 四个模块默认全开，可单独开关：
 
-**1. 四个加速模块**（默认全开，可单独开关）
-
-| 模块 | 大白话 |
+| 模块 | 作用 |
 |---|---|
-| `adaptive-cwnd` | 自动调节一次能发多少 —— 加速主要靠它 |
-| `loss-classifier` | 分辨"丢包是噪声还是真拥塞"，是噪声就不减速 |
-| `pacing` | 把数据均匀发出去，而不是一股脑挤出去 |
-| `early-loss` | 更早发现丢包（当前内核上只观测，不影响决策）|
+| `adaptive-cwnd` | 按测得的带宽设定窗口，加速主要靠它 |
+| `loss-classifier` | 丢包补偿：按测得的丢包率放大估计值，而不是退让 |
+| `pacing` | 按目标速率均匀发送 |
+| `early-loss` | 更早发现丢包（当前内核上只是观测计数） |
 
 ```bash
 ssctl enable                                  # 全开（默认）
@@ -138,99 +179,93 @@ ssctl enable --modules adaptive-cwnd,pacing   # 只开指定模块
 ssctl enable --all-off                        # 全关，作为对照基准
 ```
 
-> [!IMPORTANT]
-> **`ssctl enable` 是全机生效的。** 附加成功后它会写
-> `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会
-> 走本算法，不只是 cgroup 内进程建的连接。`ssctl drain` 是对称的反向操作：先把
-> sysctl 写回 `fallback_cc`，再等存量连接结束。
+`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它。它还会把 pacing 所依赖的 `fq` 设为 `net.core.default_qdisc` 和出口网卡的根 qdisc（VLAN、bond、网桥则是它下面的物理网卡）。在 `ssctl drain` 之前，这三项被别的东西改掉（例如"一键 BBR"脚本的 sysctl 文件被再次应用）时，daemon 都会改回来，并逐条记日志。刻意搭建的 qdisc（`htb`、`tbf`、`netem`、设了带宽的 `cake` 等）不会被动；在配置里设 `[guard] qdisc = false` 则 qdisc 完全交给你自己。
 
-**2. 十六个运行时参数**（在线生效，无需重启）
-
-发送增益、护栏降速幅度、丢包补偿上限、排队延迟判定阈值、起步激进度、速率与窗口硬上限等，
-全部可用 `ssctl set-module-config` 在线调整，在每条连接的 RTT 边界平滑切换。
+**系数。** 十七个参数（各类增益、护栏、丢包补偿上限、排队时延阈值、起步行为、速率与窗口上限）可用 `ssctl set-module-config` 在线调整，无需重启。[使用与调参指南](docs/usage.md) 逐个解释了这些参数，并给出四档现成配方，其中「高随机丢包档」适用于确实有 10%-20% 随机丢包的链路。
 
 > [!CAUTION]
-> `set-module-config` 是**全量覆盖**语义：只写一个参数时，**其余参数会被重置为命令行
-> 内置默认值**，而不是保持你配置文件里的自定义值。详见
-> [使用与调参指南](docs/usage.md#四参数调整先看这个致命陷阱)。
+> `set-module-config` 是**全量覆盖**，不是增量修改：没写的参数都会被重置为命令行的内置默认值，而不是保持你配置文件里的值。
 
-**3. 动态 RTO 调节**（默认**关闭**）
+**动态 RTO 上下限**（默认关闭）。只有 `/sys/fs/cgroup/skyline-speeder` 里的进程建立的连接才会经过 `skyline_policy`；进程不在其中**不会报任何错误**，只是 `ssctl flows` 里 *connections seen* 一直是 0。用下面的方式在该 cgroup 里启动服务：
 
-内核默认 RTO 最长能退到 120 秒——线路抖一下连接就卡死两分钟。我们实测过对照组被顶到
-**101 秒**。开启后可给它设上下限。需要目标进程位于指定 cgroup 内才生效。
+```bash
+sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命令...>
+```
 
-**4. 重传包 DSCP 标记**（默认**关闭**，且 `dscp_value = 0`）
+`skyline_cc` 本身是全局的，不需要 cgroup。
+
+**首轮冗余**（默认开启）。在配置的 `[redundancy]` 里改（`first_kib`、`delay_ms`），或在运行中的主机上用 `ssctl set-redundancy`（`--disable` 关闭）和 `ssctl reset-redundancy`。它只在 skyline_cc 启用期间运行，从不复制跑其他拥塞控制的连接。副本由 daemon 守在根上的 `fq` 按时间扣住再发；`ssctl flows` 显示已经发了多少副本、花了多少字节。
+
+**重传包 DSCP 标记**（默认关闭）。
 
 > [!WARNING]
-> **`dscp_value` 默认值 0 是占位符，不是可用值。** DSCP 0 在标准里表示"尽力而为"
-> （默认等级），打上去等于没打。
->
-> **具体数值必须由网络方（运营商 / 机房 / 上游管理员）指定**——填错了上游不认识等于白做，
-> 填成别人在用的值可能被误分策略、**反而更慢甚至被限速**。启用前请先确认该填多少。
-
-> **新手请先读 [使用与调参指南](docs/usage.md)** —— 用大白话讲清每个开关和参数管什么、
-> 调大调小分别会怎样，以及常见场景的现成配方。
+> 随附的 `dscp_value = 0` 只是占位：DSCP 0 表示尽力而为，打上去等于没打。具体数值必须由网络方给出；填成别处已在用的值，流量可能被误分类甚至限速。
 
 ## 仓库结构
 
 ```
 skyline-speeder/
-├── install.sh                    一键部署入口（Debian/Ubuntu）
-├── scripts/bootstrap.sh          远程一键安装入口（curl | sudo bash）
-├── DEPLOY.md                     面向自动化 agent 的部署手册
-├── CONTRIBUTING.md               改动前必读：本项目的硬性不变量
-├── CLAUDE.md                     AI 编码助手的仓库约定
-├── Makefile                      make bpf / rust / check / test
+├── install.sh                    一键安装（Debian/Ubuntu、Fedora/RHEL、Alpine）
+├── scripts/bootstrap.sh          远程安装入口（curl | sudo bash，或 wget | sh）
+├── Makefile                      make bpf、make check、make test
 ├── bpf/
-│   ├── skyline_cc.bpf.c          struct_ops 拥塞控制（每次 ACK 执行）
-│   ├── skyline_policy.bpf.c      cgroup sockops：CC 选择 + 动态 RTO
-│   ├── skyline_tc.bpf.c          TC egress：统计 + 重传 DSCP 标记
+│   ├── skyline_cc.bpf.c          struct_ops 拥塞控制，每个 ACK 执行
+│   ├── skyline_policy.bpf.c      cgroup sockops：选择拥塞控制，动态 RTO 上下限
+│   ├── skyline_tc.bpf.c          TC egress：统计、重传 DSCP 标记、首轮冗余
 │   └── include/skyline_abi.h     BPF 与用户态共享的 ABI
 ├── crates/
-│   ├── skyline-speederd/              常驻控制面
-│   ├── ssctl/            命令行
+│   ├── skyline-speederd/         常驻控制面
+│   ├── ssctl/                    命令行
 │   └── skyline-common/           共享 ABI 类型与配置解析
-├── config/
-│   ├── speeder-guest.toml        生产环境模板
-│   └── speeder.toml              本地开发模板
-├── packaging/
-│   ├── skyline-speederd.service
-│   └── skyline-speeder-enable.service   开机挂载 skyline_cc
-├── infra/                        安装、cgroup 工具、双 VM 测试床编排
-├── research/experiments/         性能测试 manifest、执行与分析工具
-└── docs/
-    ├── usage.md                  新手向使用与调参指南
-    ├── 01-deployment-guide.md    构建、安装、配置、验证、调参、回滚、排障
-    ├── 02-interface-reference.md 命令、线协议、配置字段、事件码
-    ├── 03-design.md              架构与各模块实现原理
-    └── 04-performance-report.md  测试环境、结果、中性性、机制验证、局限性
+├── config/                       speeder-guest.toml（安装用模板）/ speeder.toml（开发用）
+├── packaging/                    systemd 单元；openrc/ 是给 OpenRC 的同样两个服务
+├── infra/                        安装辅助、cgroup 工具、双 VM 测试床
+├── research/experiments/         测试 manifest、执行、分析与现场测量
+├── docs/                         使用指南、接口参考、设计、性能报告
+├── CHANGELOG.md                  版本说明与升级步骤
+├── DEPLOY.md                     部署与运维手册，面向自动化 agent
+└── CONTRIBUTING.md               改动不能破坏的不变量
 ```
 
 ## 从源码构建
 
+`sudo ./install.sh --source` 会把下面这些一步做完并装好。手工构建：
+
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool
+# Fedora / RHEL（RHEL 系的 libbpf-devel 在 CodeReady Builder 里：加 --enablerepo=crb）：
+#   sudo dnf install gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
+# Alpine（bpftool 在 community 仓库）：
+#   apk add build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # 生成 vmlinux.h 并编译三个 CO-RE 对象
 cargo build --workspace --release
-make check                        # 格式、静态检查与单元测试
+make check PYTHON="$(command -v python3)"   # 格式、静态检查与单元测试（实验框架的测试要 Python 3.11+）
+
+# 让每个对象过一遍内核验证器，不挂载任何东西
+skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
-`make bpf` 默认从本机 `/sys/kernel/btf/vmlinux` 读取内核类型信息；交叉构建请用 `make VMLINUX_BTF=<路径> bpf` 显式指定目标内核的 BTF。
+Debian 12 上跑 `bookworm-backports` 的 6.12 内核时，`libelf-dev` 也要取 backports 那一份：backports 的 `linux-headers` 会把 `libelf1` 带到 0.192，而 bookworm 的 `libelf-dev` 把 `libelf1` 钉在 0.188，两者装不到一起（该取哪个版本看 `apt-cache madison libelf-dev`）。`install.sh` 会自己算出这一点。
+
+`make bpf` 默认从本机 `/sys/kernel/btf/vmlinux` 读取类型信息；要用别的内核的 BTF，用 `make VMLINUX_BTF=<路径> bpf`；已有生成好的头，用 `make PREBUILT_VMLINUX_H=<路径> bpf`。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| **[docs/usage.md](docs/usage.md)** | **新手向：怎么用、模块开关、参数调整、DSCP 配置、常见配方** |
-| [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | 构建、安装、配置、启动验证、在线调参、摘除回滚、排障 |
+| **[docs/usage.md](docs/usage.md)** | **新手向：每个开关和参数、现成配方、排障** |
+| [DEPLOY.md](DEPLOY.md) | 部署与运维手册，面向自动化 agent、运维同样照它操作：前置条件、安装、验证门禁、升级、排障、卸载 |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、控制面线协议、配置字段、事件码 |
-| [docs/03-design.md](docs/03-design.md) | 架构、各模块实现原理、控制面设计、系数选择依据 |
-| [docs/04-performance-report.md](docs/04-performance-report.md) | 测试环境、目标环境结果、中性性、机制验证、内核适配性、局限性 |
-| [research/experiments/README.md](research/experiments/README.md) | 复现性能测试的完整操作步骤 |
-| [DEPLOY.md](DEPLOY.md) | 面向自动化 agent 的确定性部署手册 |
+| [docs/03-design.md](docs/03-design.md) | 架构与各模块的实现原理 |
+| [docs/04-performance-report.md](docs/04-performance-report.md) | 受控测试床：环境、与 bbr 对比的结果、局限性 |
+| [research/experiments/README.md](research/experiments/README.md) | 复现性能测试 |
+
+## 参与贡献
+
+请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目有几条硬性不变量：两侧必须逐字节一致的 ABI 结构体、必须短于 16 字节的注册名、与 socket 路径耦合的 systemd `RuntimeDirectory`，以及三个完全不报错的失效点。内核验证器是硬门禁：加载不了的改动不算改动。
 
 ## 许可
 
@@ -247,6 +282,6 @@ GPL-2.0 不是偏好选择：`skyline_cc.bpf.c` 中有若干段是对 GPL-2.0 Li
 
 <div align="center">
 
-**Skyline Connect** 独家冠名
+**[Skyline Connect](https://www.skylineconnect.io)** 独家冠名
 
 </div>
