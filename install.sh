@@ -95,9 +95,24 @@ case "${SKYLINE_VERBOSE:-0}" in 1|yes|true) VERBOSE=1 ;; *) VERBOSE=0 ;; esac
 LOG=/var/log/skyline-speeder-install.log
 CFG=/etc/skyline-speeder/speeder.toml
 STATE=/etc/skyline-speeder/pre-install-state
+# The fallback_cc an install last chose for $CFG, one name: how a later run --
+# an upgrade, or a reinstall after --uninstall, which keeps $CFG -- tells its
+# own choice, which follows the host's boot configuration, from a value the
+# operator wrote (fallback_plan). TEMPLATE_FALLBACK is the value the templates
+# (config/speeder.toml, config/speeder-guest.toml) ship: a sync point.
+FALLBACK_REC=/etc/skyline-speeder/installer-fallback-cc
+TEMPLATE_FALLBACK=cubic
+# The files an installation puts in place outside /etc/skyline-speeder, the
+# ones --uninstall removes: any of them still there means an installation is
+# (install_in_place).
+INSTALL_PATHS=(/etc/systemd/system/skyline-speederd.service
+               /etc/systemd/system/skyline-speeder-enable.service
+               /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable
+               /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl
+               /opt/skyline-speeder)
 # What an install added to this host, so --uninstall can take exactly that
 # away again and nothing else. Separate files, not more keys in $STATE: that
-# one is written once and then closed forever (it must never record
+# one is written once per installation and then closed (it must never record
 # skyline_cc as the "original"), while a later upgrade run can add packages.
 ADDED_PKGS=/etc/skyline-speeder/added-packages
 ADDED_RUSTUP=/etc/skyline-speeder/added-rustup
@@ -893,8 +908,9 @@ conf_sysctl_settings() {
     sysctl_key_settings /etc/sysctl.conf
 }
 
-# boot_fallback_cc: "name|file" for the fallback_cc a new speeder.toml gets, or
-# nothing to keep the template's. fallback_cc is what new connections get
+# boot_fallback_cc: "name|file" for the fallback_cc the installer chooses (in
+# a new speeder.toml, or one still holding its earlier choice: fallback_plan),
+# or nothing to keep the value there. fallback_cc is what new connections get
 # whenever skyline_cc is not attached -- `ssctl drain`, the enable unit's
 # ExecStop, and briefly every enable, which writes it before the attach -- so
 # the template's cubic took a host that boots into bbr off bbr each time. The
@@ -917,6 +933,51 @@ boot_fallback_cc() {
         esac
         return 0
     done <<<"$BOOT_SETTINGS"
+}
+
+# fallback_plan: what this run does with fallback_cc in $CFG. FB_NOW is the
+# value there (the template's while there is no $CFG yet; empty without a
+# plain `fallback_cc = "<name>"` line), FB_REC the one $FALLBACK_REC says an
+# earlier run chose, FB_MINE 1 when FB_NOW is the installer's to choose, and
+# FB_NEW / FB_FROM the algorithm it then gets and the boot file that selects
+# it -- both empty when it keeps FB_NOW.
+# The installer's own: a $CFG this run creates, and FB_NOW equal to FB_REC.
+# Without a record, $CFG predates it: the installers before it chose only in a
+# file they created and left the template's value there when no boot setting
+# chose, so that value is taken as their choice too. Each run then chooses
+# again, as for a new file, so a host that moved to bbr after an --uninstall
+# (which keeps $CFG) does not keep the first install's cubic through the
+# reinstall (issue #40). Any other value is the operator's and is never
+# rewritten.
+fallback_plan() {
+    local choice
+    FB_NOW=$TEMPLATE_FALLBACK FB_REC= FB_MINE=0 FB_NEW= FB_FROM=
+    if [ -e "$CFG" ]; then
+        FB_NOW=$(sed -n 's/^fallback_cc = "\([^"]*\)"$/\1/p' "$CFG" 2>/dev/null || true)
+    fi
+    FB_REC=$(sed -n 1p "$FALLBACK_REC" 2>/dev/null || true)
+    case "$FB_REC" in *[!A-Za-z0-9_]*) FB_REC= ;; esac
+    if [ -z "$FB_NOW" ]; then
+        return 0
+    elif [ "$CFG_FRESH" -eq 1 ] || [ "$FB_NOW" = "${FB_REC:-$TEMPLATE_FALLBACK}" ]; then
+        FB_MINE=1
+    else
+        return 0
+    fi
+    choice=$(boot_fallback_cc)
+    [ -n "$choice" ] || return 0
+    FB_NEW=${choice%%|*} FB_FROM=${choice#*|}
+}
+
+# install_in_place: whether anything of INSTALL_PATHS is there -- units,
+# binaries, the objects. /etc/skyline-speeder alone does not count: --uninstall
+# keeps it, and a configuration directory changes nothing about the network.
+install_in_place() {
+    local path
+    for path in "${INSTALL_PATHS[@]}"; do
+        [ ! -e "$path" ] || return 0
+    done
+    return 1
 }
 
 # `ssctl status --json` pretty-prints one "key": value per line. awk rather than a
@@ -2013,13 +2074,9 @@ if [ "$MODE" = uninstall ]; then
     # finished install leaves packages recorded there that must still be
     # removable.
     ACTIVE=0
-    for path in /etc/systemd/system/skyline-speederd.service \
-                /etc/systemd/system/skyline-speeder-enable.service \
-                /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable \
-                /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl \
-                /opt/skyline-speeder; do
-        [ ! -e "$path" ] || { ACTIVE=1; break; }
-    done
+    if install_in_place; then
+        ACTIVE=1
+    fi
     if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = skyline_cc ]; then
         ACTIVE=1
     fi
@@ -2260,9 +2317,23 @@ log "before: tcp_congestion_control=$BEFORE_CC default_qdisc=$BEFORE_DQ egress: 
 [ -z "$CONF_SETTINGS" ] || log "set in /etc/sysctl.conf, not read at boot (key|value|file):" "$CONF_SETTINGS"
 # Whether this run writes speeder.toml from the template, which section 8 then
 # adapts to the host. An existing one belongs to its operator -- also when an
-# earlier run left it behind by failing -- and is never rewritten.
+# earlier run left it behind by failing: section 8 rewrites in it only what the
+# installer itself put there, the placeholder tc_interface and its own choice
+# of fallback_cc.
 CFG_FRESH=1
 [ ! -e "$CFG" ] || CFG_FRESH=0
+# Whether $STATE describes an installation that is gone: --uninstall removes
+# everything but /etc/skyline-speeder, the snapshot included. The host has run
+# without Skyline Speeder since, so what it runs now is what came before THIS
+# install, and section 9 replaces the snapshot with it -- the summary's "was"
+# and --restore-pre-install then name the same thing, not the first install's
+# cubic after a move to bbr in between. Kept while anything of an installation
+# is in place (an upgrade, whose skyline_cc and guarded fq are no "original"),
+# and while skyline_cc is still the default.
+STATE_SPENT=0
+if [ -e "$STATE" ] && ! install_in_place && [ "$BEFORE_CC" != skyline_cc ]; then
+    STATE_SPENT=1
+fi
 
 # --- 5. packages -----------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
@@ -2594,12 +2665,22 @@ if [ "$MODE" = check ]; then
         [ -n "$key" ] || continue
         info "set in $file (by sysctl -p / sysctl --system, not at boot): ${key##*.} = $value"
     done <<<"$CONF_SETTINGS"
-    if [ "$CFG_FRESH" -eq 0 ]; then
-        info "$CFG exists and is kept as it is"
-    elif REPLY=$(boot_fallback_cc) && [ -n "$REPLY" ]; then
-        info "a new $CFG would get fallback_cc = ${REPLY%%|*}, which ${REPLY#*|} selects at boot"
-    else
+    fallback_plan
+    if [ "$CFG_FRESH" -eq 1 ] && [ -n "$FB_NEW" ]; then
+        info "a new $CFG would get fallback_cc = $FB_NEW, which $FB_FROM selects at boot"
+    elif [ "$CFG_FRESH" -eq 1 ]; then
         info "a new $CFG would keep the template's fallback_cc: no boot setting selects a congestion control this kernel has"
+    elif [ "$FB_MINE" -eq 0 ]; then
+        info "$CFG exists and is kept as it is; its fallback_cc ${FB_NOW:+($FB_NOW) }is not one this installer chose"
+    elif [ -z "$FB_NEW" ]; then
+        info "$CFG exists and is kept as it is; fallback_cc stays $FB_NOW: no boot setting selects a congestion control this kernel has"
+    elif [ "$FB_NEW" = "$FB_NOW" ]; then
+        info "$CFG exists and is kept as it is; fallback_cc is $FB_NOW, which $FB_FROM selects at boot"
+    else
+        info "$CFG exists and is kept as it is, but for fallback_cc, still this installer's choice: $FB_NOW would become $FB_NEW, which $FB_FROM selects at boot"
+    fi
+    if [ "$STATE_SPENT" -eq 1 ]; then
+        info "$STATE describes an installation that was removed: an install would replace it with what this host runs now"
     fi
     info "preflight complete"
     printf '\n' >&3
@@ -3038,24 +3119,35 @@ elif [ -n "$TC_TYPE" ] && [ "$TC_TYPE" != 1 ]; then
     warn "runtime.tc_interface $DEV is not an Ethernet device (type $TC_TYPE, e.g. a tunnel): skyline-speederd does not attach skyline_tc to it, and the qdisc guard does not reach the NIC that carries its traffic. Point it at the NIC: $TC_FIX"
 fi
 # fallback_cc: the algorithm this host boots into (boot_fallback_cc says why),
-# on first install only, as above.
-if [ "$CFG_FRESH" -eq 1 ]; then
-    FALLBACK_BOOT=$(boot_fallback_cc)
-    FALLBACK_NOW=$(sed -n 's/^fallback_cc = "\([^"]*\)"$/\1/p' "$CFG" 2>/dev/null || true)
-    if [ -z "$FALLBACK_BOOT" ]; then
-        ok "fallback_cc left at ${FALLBACK_NOW:-the template value}: no boot setting selects a congestion control this kernel has"
-    elif [ "${FALLBACK_BOOT%%|*}" = "$FALLBACK_NOW" ]; then
-        ok "fallback_cc is $FALLBACK_NOW, which ${FALLBACK_BOOT#*|} selects at boot"
-    elif [ -n "$FALLBACK_NOW" ]; then
-        sed -i "s|^fallback_cc = \"$FALLBACK_NOW\"\$|fallback_cc = \"${FALLBACK_BOOT%%|*}\"|" "$CFG"
-        ok "fallback_cc set to ${FALLBACK_BOOT%%|*}, which ${FALLBACK_BOOT#*|} selects at boot"
+# as long as the value there is the installer's own choice (fallback_plan says
+# which are) -- like the placeholder above, a value the operator set is never
+# rewritten. The record names what $CFG holds now, so the next run can tell.
+fallback_plan
+if [ "$FB_MINE" -eq 0 ]; then
+    ok "fallback_cc left as configured${FB_NOW:+ ($FB_NOW)}: not a value this installer chose"
+elif [ -z "$FB_NEW" ]; then
+    ok "fallback_cc left at $FB_NOW: no boot setting selects a congestion control this kernel has"
+elif [ "$FB_NEW" = "$FB_NOW" ]; then
+    ok "fallback_cc is $FB_NOW, which $FB_FROM selects at boot"
+else
+    sed -i "s|^fallback_cc = \"$FB_NOW\"\$|fallback_cc = \"$FB_NEW\"|" "$CFG"
+    if [ "$CFG_FRESH" -eq 1 ]; then
+        ok "fallback_cc set to $FB_NEW, which $FB_FROM selects at boot"
+    else
+        ok "fallback_cc changed from $FB_NOW to $FB_NEW, which $FB_FROM selects at boot"
     fi
+    FB_NOW=$FB_NEW
+fi
+if [ "$FB_MINE" -eq 1 ]; then
+    { printf '%s\n' "$FB_NOW" >"$FALLBACK_REC"; } 2>/dev/null \
+        || warn "could not write $FALLBACK_REC, the fallback_cc this installer chose ($FB_NOW)"
 fi
 
 # --- 9. record what was there, then start -----------------------------------
 # Snapshot before anything starts changing sysctls: the daemon writes
 # fallback_cc on load and `ssctl enable` writes skyline_cc after it attaches.
-# Only written once -- a reinstall must not record skyline_cc as the "original".
+# Written once per installation -- an upgrade must not record skyline_cc as the
+# "original" -- and replaced when the one it described was removed (STATE_SPENT).
 # The root qdiscs are those of the devices the guard will manage: two
 # parallel, space-separated lists (one device: just its name and summary).
 ROOTS_SEEN=
@@ -3068,7 +3160,7 @@ if [ ! -e "$STATE" ] && [ "$BEFORE_CC" = skyline_cc ]; then
     # known any more, and this run's view -- skyline_cc, and the guard's fq --
     # recorded as the "original" would be what --restore-pre-install puts back.
     log "no pre-install snapshot written: skyline_cc is already the default, so what came before it is not known"
-elif [ ! -e "$STATE" ]; then
+elif [ ! -e "$STATE" ] || [ "$STATE_SPENT" -eq 1 ]; then
     install -d /etc/skyline-speeder
     cat > "$STATE" <<EOF
 PRE_INSTALL_CC=$BEFORE_CC
@@ -3080,7 +3172,11 @@ EOF
     # "original".
     printf 'PRE_INSTALL_QDISC_DEV=%q\nPRE_INSTALL_ROOT_QDISC=%q\n' \
         "${BEFORE_DEVS[*]}" "${BEFORE_ROOTS[*]}" >>"$STATE"
-    ok "recorded pre-install state: cc=$BEFORE_CC qdisc=$BEFORE_DQ root: ${ROOTS_SEEN:-none}"
+    if [ "$STATE_SPENT" -eq 1 ]; then
+        ok "replaced the pre-install snapshot of the removed installation: cc=$BEFORE_CC qdisc=$BEFORE_DQ root: ${ROOTS_SEEN:-none}"
+    else
+        ok "recorded pre-install state: cc=$BEFORE_CC qdisc=$BEFORE_DQ root: ${ROOTS_SEEN:-none}"
+    fi
 elif ! grep -q '^PRE_INSTALL_ROOT_QDISC=' "$STATE"; then
     # Only a snapshot from before the guard existed (0.2.0) has no such line
     # at all. Those versions never touched a root qdisc, so what is there now
@@ -3523,9 +3619,9 @@ fi
 # bug rather than as the truth.
 #
 # Read from $STATE, in a subshell, because that is the file the restore itself
-# reads -- and on a reinstall it holds the FIRST install's values, which are not
-# what this run sees now. Without a snapshot yet, this run's own observation is
-# what is about to be written into one.
+# reads -- and on an upgrade it holds the values from before the first install,
+# which are not what this run sees now. Without a snapshot yet, this run's own
+# observation is what is about to be written into one.
 RESTORE_DESC=$(
     if [ ! -r "$STATE" ] && [ "$BEFORE_CC" = skyline_cc ]; then
         # No snapshot was written; see "record what was there".
