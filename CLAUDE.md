@@ -13,7 +13,7 @@ bulk rename, a new writer of a sysctl, an ABI change), read the `CLAUDE.md` of e
 |---|---|
 | `bpf/CLAUDE.md` | vmlinux.h and kfunc declarations, CO-RE portability, the algorithm name, ABI versions, the two struct_ops maps |
 | `crates/CLAUDE.md` | order and writers of the global sysctls, the guard, configuration-plane semantics |
-| `config/CLAUDE.md` | `[rack_tuning]` in the guest config, `tc_interface` |
+| `config/CLAUDE.md` | `[rack_tuning]` and `tcp_wmem_max` in the guest config, `tc_interface` |
 | `packaging/CLAUDE.md` | install paths, `RuntimeDirectory=` / `checkpath` |
 | `infra/CLAUDE.md` | boot scripts and sysctls, the scripts a release ships, `core-portability.sh` |
 | `docs/CLAUDE.md` | documentation map |
@@ -49,13 +49,13 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf   # v
   `RuntimeDirectory=` and OpenRC's `checkpath -d` are the parent of `socket_path`, `events_path` and `state_path`;
   `StateDirectory=` and the second `checkpath` are the parent of `DAEMON_REPORTS_DIR`. → `packaging/CLAUDE.md`
 - **Error reports** are sent only on a `y` typed on a terminal (or `SKYLINE_FEEDBACK=yes`), scrubbed first; the daemon
-  only records. The DSN is in the tree only sealed, by `infra/seal-feedback-dsn.py`, in two copies. → `crates/CLAUDE.md`
+  only records. The DSN is in the tree only sealed, by `infra/seal-feedback-dsn.py`, in three copies. → `crates/CLAUDE.md`
 - **`PRR-SSRB`** in `bpf/skyline_cc.bpf.c` is RFC 6937 terminology, not the project's old name SSR: never rename it, and
   protect it with word boundaries in a bulk rename.
 - **Configuration plane:** every `set-*` command is an absolute overwrite; a switch writes the slot before the sequence
   number, and BPF reads only each flow's own copy. → `crates/CLAUDE.md`
-- **`[rack_tuning]`** in `config/speeder-guest.toml` stays commented out; never weaken
-  `guest_config_never_owns_global_sysctls` to make a case pass. → `config/CLAUDE.md`
+- **`[rack_tuning]`** in `config/speeder-guest.toml` stays commented out, and its `[guard] tcp_wmem_max` stays 0;
+  never weaken `guest_config_never_owns_global_sysctls` to make a case pass. → `config/CLAUDE.md`
 
 ## Silent failures (no error, just no effect)
 
@@ -77,19 +77,20 @@ The `CLAUDE.md` files are public: no host addresses, account names, tokens or pe
 
 ## Every change
 
-- **Language (hard rule):** `README.zh.md` is the only Chinese file; everything else -- docs, comments, script and
-  report output, test strings, commits, PRs -- is English. The two READMEs change together.
+- **Language (hard rule):** the README's six translations (`README.zh.md`, `.zh-TW`, `.ja`, `.ko`, `.ru`, `.fr`) are
+  the only non-English files; everything else -- docs, comments, script and report output, test strings, commits,
+  PRs -- is English. The seven READMEs change together; the details live in `docs/01-features.md`, English only.
 - **Docs to update** (full table in `CONTRIBUTING.md`): ABI struct → its version + `docs/02` section 5; `ssctl` command
   or field → `docs/02`; config field → `config/*.toml` + `docs/02` section 6; install flow → `DEPLOY.md`, `install.sh`,
   `scripts/bootstrap.sh` (and the READMEs and `docs/usage.md` where they describe it); a new feature, default or report
-  wording in `crates/ssctl/src/view.rs` → both READMEs' feature table, its subsection and the report key
+  wording in `crates/ssctl/src/view.rs` → `docs/01-features.md`'s feature table, its subsection and the report key
   (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports); an invariant → its directory's
   `CLAUDE.md`, `CONTRIBUTING.md` and the PR template's Invariants list; algorithm behaviour → `docs/03`.
 - **Does it need a release?** Every PR answers in its "Prebuilt release" section. The one-line install takes the latest
-  release, not `main` (hosts that cannot run it build `main`: `prebuilt_blocker` in `install.sh`), so a change in
-  `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` or a shipped `infra/*.sh` reaches users only with a
-  release; `install.sh` and `scripts/bootstrap.sh` usually take effect on merge; docs, CI and the harness never need
-  one. Several PRs may share a release, but each PR says so.
+  release, not `main`: its artifact, and its signed source tree for `install.sh` (hosts that cannot run the artifact
+  build that tree: `prebuilt_blocker` in `install.sh`), so a change in `bpf/`, `crates/`, `config/speeder-guest.toml`,
+  `packaging/`, a shipped `infra/*.sh` or `install.sh` reaches users only with a release; `scripts/bootstrap.sh`
+  takes effect on merge; docs, CI and the harness never need one. Several PRs may share a release, but each PR says so.
 - **Releasing:** bump `[workspace.package] version` and the three crates in `Cargo.lock` (builds run `--locked`), then
   tag `v<version>`; `release.yml` refuses a mismatch. **No changelog:** the repository keeps none -- never add
   `CHANGELOG.md` or a release-notes file. If the data plane changed, rerun `infra/kernel/core-portability.sh` first.

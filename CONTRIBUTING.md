@@ -88,7 +88,7 @@ Breaking any of these is a defect regardless of what else the change does.
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must be the parent directory of `socket_path`** (and of `events_path`, `state_path`): the unit sets `ProtectSystem=strict`, under which this is the one directory in `/run` the daemon can write |
 | `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC's `RuntimeDirectory=`: **must be the parent directory of `socket_path`** (and of `events_path`, `state_path`), where the daemon opens its event log first |
 | `StateDirectory=skyline-speeder`, `checkpath -d /var/lib/skyline-speeder` | `packaging/skyline-speederd.service`, `packaging/openrc/skyline-speederd` | **Must be the parent directory of `DAEMON_REPORTS_DIR`** (`/var/lib/skyline-speeder/reports`, `crates/skyline-common`), which `ssctl` and `install.sh` (`FEEDBACK_DAEMON_REPORTS`, and `--uninstall`, which removes it) read too: under `ProtectSystem=strict` it is the one directory under `/var/lib` the daemon can write, and a mismatch only costs a line on stderr when a report cannot be written -- the error report is silently lost |
-| Error reports | `install.sh` ("error reports"), `crates/ssctl/src/feedback.rs`, `crates/skyline-speederd/src/reports.rs` | **Sent only on a `y` typed on a terminal, or with `SKYLINE_FEEDBACK=yes`**: never with no terminal, never by skyline-speederd itself, which only records. Everything shown or sent is scrubbed first, by the same list in `feedback_scrub` and `scrub`, which `cargo test -p ssctl` runs over one text. The DSN is in the tree only sealed, in two copies that `infra/seal-feedback-dsn.py` writes together (`FEEDBACK_SEALED` in `install.sh`, `crates/ssctl/src/feedback-dsn.sealed`) and `cargo test -p ssctl` compares; a plain DSN or a Sentry auth token never goes into the tree |
+| Error reports | `install.sh` ("error reports"), `scripts/bootstrap.sh` ("error reports", POSIX sh), `crates/ssctl/src/feedback.rs`, `crates/skyline-speederd/src/reports.rs` | **Sent only on a `y` typed on a terminal, or with `SKYLINE_FEEDBACK=yes`**: never with no terminal, never by skyline-speederd itself, which only records. Everything shown or sent is scrubbed first, by the same list in `feedback_scrub`, `fb_scrub` and `scrub`, which `cargo test -p ssctl` runs over one text. The DSN is in the tree only sealed, in three copies that `infra/seal-feedback-dsn.py` writes together (`FEEDBACK_SEALED` in `install.sh` and in `scripts/bootstrap.sh`, `crates/ssctl/src/feedback-dsn.sealed`) and `cargo test -p ssctl` compares; a plain DSN or a Sentry auth token never goes into the tree |
 
 > The `RuntimeDirectory` / `socket_path` coupling is a hole this project has
 > already fallen into once: a bulk rename changed `RuntimeDirectory` to
@@ -167,8 +167,14 @@ careful around the code that touches them.
    root qdisc of `runtime.tc_interface` (`fq`, or `mq` over `fq` on a
    multi-queue NIC; when that is a VLAN, bond or bridge whose root is
    `noqueue`, the NICs with a `device` link under it instead, never a tap or
-   veth). From `enable` to `drain` the daemon is the only writer of all three
-   (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
+   veth). Unless `[guard] tcp_wmem_max = 0` it also raises the maximum of
+   `net.ipv4.tcp_wmem` to at least that value -- never lowers it -- and keeps it
+   there; `drain` puts back what the first raise replaced, right after
+   `fallback_cc` and under the same lock, only while the sysctl still reads
+   what the daemon wrote (something else that changed it meant it). The
+   original is also kept in `/run/skyline-speeder/tcp-wmem-hold`, so a daemon
+   restarted in between still puts it back. From `enable` to `drain` the
+   daemon is the only writer of all of them (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
    qdiscs of their own). `boot-enable.sh` used to write `default_qdisc=fq` once
    at boot and no longer does -- do not add it back: it cannot change a NIC's
    existing root qdisc, and two writers of one setting drift apart. Related
@@ -235,14 +241,15 @@ and **must not be used to draw performance conclusions**.
 
 | Document | Reader and content |
 |---|---|
-| `README.md` / `README.zh.md` | Users, in the order a newcomer needs it: what it is, the kernel requirement, quick start, how it works and how the three algorithms differ, configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means), layout, building, documentation, measured performance, contributing, license. The two say the same thing |
+| `README.md` and its translations `README.zh.md` (Simplified Chinese), `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.ru.md`, `README.fr.md` | Users, short: what it is, the requirements, quick start, advanced usage (installing from a clone, the everyday `ssctl` commands, the documentation), a summary of the measured performance, license. All seven say the same thing |
+| `docs/01-features.md` | Everything the README leaves out: what the installer does, how it works and how the three algorithms differ, configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means), layout, building from source, the measured performance in full |
 | `DEPLOY.md` | The one deployment and operations manual, written for automation agents and followed by people: prerequisites, every installer step, verification gates, the cgroup, the guard, upgrades, removal, troubleshooting |
 | `docs/usage.md` | Newcomers: every switch and parameter, four presets, dynamic RTO, DSCP, finding the cause of a stalled connection |
 | `docs/02-interface-reference.md` | `ssctl` commands, the wire protocol, status fields and counters, ABI versions, configuration fields, event codes, guard rules |
 | `docs/03-design.md` | How each module works, the trade-offs, open questions |
 | `docs/04-performance-report.md` | The two-VM test bed's data, what it does and does not show |
 | `research/experiments/README.md` | The experiment harness and how to reproduce a run |
-| `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the README's performance section cites; not test-bed data |
+| `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the performance sections of the READMEs and `docs/01-features.md` cite; not test-bed data |
 | `CLAUDE.md` and the `CLAUDE.md` in `bpf/`, `crates/`, `config/`, `packaging/`, `infra/` and `docs/` | The same conventions, for AI coding agents. The root file is loaded in every session and holds the repository-wide rules and an index; each directory's file is loaded when an agent reads or edits a file there and holds that directory's details |
 
 ## Documentation you must update with your change
@@ -252,17 +259,17 @@ and **must not be used to draw performance conclusions**.
 | ABI struct | `skyline_abi.h` + `crates/skyline-common` + the version that covers it (`SKYLINE_ABI_VERSION`, `SKYLINE_RTO_TUNING_ABI_VERSION`, `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` or `SKYLINE_REDUNDANCY_ABI_VERSION`) + `docs/02-interface-reference.md` section 5 |
 | `ssctl` command or field | `docs/02-interface-reference.md` |
 | Config field | `config/*.toml` + `docs/02-interface-reference.md` section 6 |
-| Install flow | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and both READMEs and `docs/usage.md` where they describe it) |
+| Install flow | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and the READMEs, `docs/01-features.md` and `docs/usage.md` where they describe it) |
 | Algorithm behaviour | `docs/03-design.md`; performance claims need data in `docs/04-performance-report.md` |
-| Anything user-facing in the README | Both `README.md` and `README.zh.md` |
-| A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | Both READMEs' table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
+| Anything user-facing in the README | `README.md` and all six translations |
+| A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | `docs/01-features.md`: the table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
 | A hard invariant or the contribution process | This file, the `CLAUDE.md` of the directory the invariant lives in (the same conventions, for AI coding agents; the root `CLAUDE.md` keeps a one-line summary of each) and the Invariants list in `.github/PULL_REQUEST_TEMPLATE.md` |
 | A release (`v*` tag) | `[workspace.package] version` in `Cargo.toml` and the three workspace crates in `Cargo.lock`; `release.yml` refuses a tag that is not exactly `v<version>`. There is no changelog to update: the repository keeps none |
 
 ## Style
 
-- **Language:** everything in this repository is English except `README.zh.md`, the Chinese twin of
-  `README.md`; the two READMEs change together.
+- **Language:** everything in this repository is English except the six translations of `README.md`:
+  `README.zh.md` (Simplified Chinese), `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.ru.md`, `README.fr.md`; the seven READMEs change together.
 - **Rust:** `cargo fmt` is mandatory; `make check` enforces it.
 - **BPF C:** four-space indentation.
 - **Shell:** `set -euo pipefail`; the POSIX sh scripts (`scripts/bootstrap.sh`,
@@ -341,16 +348,17 @@ See `.gitignore`. In particular:
 
 - Say whether the change needs a new prebuilt release, and why (the "Prebuilt
   release" section of the PR template). The one-line install installs the
-  latest release's prebuilt artifact, not `main` (a host that cannot run the
-  published binaries -- not x86_64, glibc older than 2.34, musl older than
-  1.2.5 -- builds the fetched tree, `main` by default, from source), so a change
-  that lives in the artifact reaches those users only with the next release --
-  and nothing fails in the meantime; it just is not there:
+  latest release's prebuilt artifact, not `main`, with the `install.sh` of that
+  release's signed source tree (a host that cannot run the published binaries
+  -- not x86_64, glibc older than 2.34, musl older than 1.2.5 -- builds that
+  tree from source), so a change reaches those users only with the next
+  release -- and nothing fails in the meantime; it just is not there:
 
   | The change touches | Release needed? | Why |
   |---|---|---|
   | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` (the systemd units and the OpenRC scripts), the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact (the OpenRC scripts from v0.4.1 on: Alpine installs the musl artifact, and the installer prefers the two scripts in it) |
-  | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; but `bootstrap.sh --uninstall`, and an upgrade run from the tree an install keeps, use the installer kept in `/usr/local/src/skyline-speeder`, not `main`'s. Release first when the new installer needs something the released artifact does not have yet |
+  | `install.sh` | **yes** | from 0.6.0 the one-line install runs the `install.sh` of the latest release's signed source tree, not `main`'s (`--ref main` takes `main`'s); `bootstrap.sh --uninstall`, and an upgrade run from the tree an install keeps, use the installer kept in `/usr/local/src/skyline-speeder` |
+  | `scripts/bootstrap.sh` | no | the one-line command fetches it from `main` itself; keep it working with the installer of the latest release |
   | docs, the experiment harness, CI, anything only a source build uses | no | not in the artifact |
 
   A release can wait and bundle several PRs, but the PR has to say that it goes
