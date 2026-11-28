@@ -64,3 +64,10 @@ Kernel it ran on: `uname -r` =
      on what test bed, with how many samples. A machine that does not pass
      `infra/preflight.sh formal` cannot support a performance conclusion.
      If the PR makes no performance claim, write "none". -->
+
+## Hard rules
+
+<!-- The maintainer's hard rules for AI agents, in full in the root CLAUDE.md
+     (first section) and in CONTRIBUTING.md. Keep this line. -->
+
+- [ ] An agent kept the hard rules: nothing deleted (only `/pr-cleanup` typed by the maintainer, or trimming memory); no changelog or other file that records version updates (the changes are described here); everything here in English; only this repository's code read or changed, and no message to another session without the maintainer's consent; this PR merged only by the maintainer, or by `gh pr merge <n> --squash --match-head-commit <sha>` after the maintainer agreed to merging this one PR
